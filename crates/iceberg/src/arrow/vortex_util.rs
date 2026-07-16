@@ -17,22 +17,10 @@
 
 //! Shared helpers for the vortex file format integration.
 
-use vortex::VortexSessionDefault;
 use vortex::error::VortexError;
 use vortex::extension::datetime::TimeUnit;
-use vortex::session::VortexSession;
 
 use crate::{Error, ErrorKind, Result};
-
-/// Creates a [`VortexSession`] holding the array, layout and runtime
-/// registries.
-///
-/// The session captures the current tokio runtime handle at construction
-/// time, so it must be created from within the runtime that will drive the
-/// vortex reads and writes.
-pub(crate) fn vortex_session() -> VortexSession {
-    <VortexSession as VortexSessionDefault>::default()
-}
 
 /// Converts a [`VortexError`] into an iceberg [`Error`].
 pub(crate) fn to_iceberg_error(err: VortexError) -> Error {

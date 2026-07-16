@@ -27,6 +27,7 @@ use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use vortex::VortexSessionDefault;
 use vortex::array::VortexSessionExecute;
 use vortex::array::arrow::ArrowSessionExt;
 use vortex::array::buffer::BufferHandle;
@@ -45,12 +46,13 @@ use vortex::io::VortexReadAt;
 use vortex::layout::scan::split_by::SplitBy;
 use vortex::scalar::{DecimalValue, Scalar};
 use vortex::scan::selection::Selection;
+use vortex::session::VortexSession;
 
 use super::DEFAULT_RANGE_FETCH_CONCURRENCY;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::CountingFileRead;
-use crate::arrow::{convert_temporal_value, to_iceberg_error, vortex_session};
+use crate::arrow::{convert_temporal_value, to_iceberg_error};
 use crate::expr::{BoundPredicate, BoundReference, PredicateOperator};
 use crate::io::{FileIO, FileRead};
 use crate::metadata_columns::RESERVED_FIELD_ID_FILE;
@@ -70,7 +72,9 @@ pub(super) async fn read_vortex_task(
     // Start loading the delete files concurrently with opening the data file.
     let delete_filter_rx = delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
 
-    let session = vortex_session();
+    // The session captures the current tokio runtime handle at construction
+    // time, so it is created here, inside the runtime driving the scan.
+    let session = VortexSession::default();
 
     // Open the vortex file through iceberg's FileIO.
     let input_file = file_io.new_input(&task.data_file_path)?;
@@ -615,8 +619,10 @@ mod tests {
     use futures::TryStreamExt;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use tempfile::TempDir;
+    use vortex::VortexSessionDefault;
+    use vortex::session::VortexSession;
 
-    use crate::arrow::{ArrowReaderBuilder, vortex_session};
+    use crate::arrow::ArrowReaderBuilder;
     use crate::expr::{Bind, Reference};
     use crate::io::FileIO;
     use crate::runtime::Runtime;
@@ -742,7 +748,7 @@ mod tests {
 
     async fn write_test_file(file_path: &str, file_io: &FileIO) -> crate::spec::DataFile {
         let output = file_io.new_output(file_path).unwrap();
-        let mut writer = VortexWriterBuilder::new(test_schema(), vortex_session())
+        let mut writer = VortexWriterBuilder::new(test_schema(), VortexSession::default())
             .build(output)
             .await
             .unwrap();
