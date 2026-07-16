@@ -3247,7 +3247,6 @@ pub async fn iceberg::writer::file_writer::VortexWriter::write(&mut self, batch:
 pub struct iceberg::writer::file_writer::VortexWriterBuilder
 impl iceberg::writer::file_writer::VortexWriterBuilder
 pub fn iceberg::writer::file_writer::VortexWriterBuilder::new(schema: iceberg::spec::SchemaRef) -> Self
-pub fn iceberg::writer::file_writer::VortexWriterBuilder::with_match_mode(self, match_mode: iceberg::arrow::FieldMatchMode) -> Self
 impl core::clone::Clone for iceberg::writer::file_writer::VortexWriterBuilder
 pub fn iceberg::writer::file_writer::VortexWriterBuilder::clone(&self) -> iceberg::writer::file_writer::VortexWriterBuilder
 impl core::fmt::Debug for iceberg::writer::file_writer::VortexWriterBuilder

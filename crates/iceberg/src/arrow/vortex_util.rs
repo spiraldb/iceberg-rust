@@ -19,9 +19,10 @@
 
 use vortex::VortexSessionDefault;
 use vortex::error::VortexError;
+use vortex::extension::datetime::TimeUnit;
 use vortex::session::VortexSession;
 
-use crate::{Error, ErrorKind};
+use crate::{Error, ErrorKind, Result};
 
 /// Creates a [`VortexSession`] holding the array, layout and runtime
 /// registries.
@@ -36,4 +37,32 @@ pub(crate) fn vortex_session() -> VortexSession {
 /// Converts a [`VortexError`] into an iceberg [`Error`].
 pub(crate) fn to_iceberg_error(err: VortexError) -> Error {
     Error::new(ErrorKind::Unexpected, "Vortex error").with_source(err)
+}
+
+/// Losslessly converts a temporal value between units; conversions that would
+/// lose precision (e.g. microseconds to seconds) are rejected.
+pub(crate) fn convert_temporal_value(value: i64, from: TimeUnit, to: TimeUnit) -> Result<i64> {
+    fn nanos_per(unit: TimeUnit) -> i64 {
+        match unit {
+            TimeUnit::Nanoseconds => 1,
+            TimeUnit::Microseconds => 1_000,
+            TimeUnit::Milliseconds => 1_000_000,
+            TimeUnit::Seconds => 1_000_000_000,
+            TimeUnit::Days => 86_400_000_000_000,
+        }
+    }
+
+    let (from_nanos, to_nanos) = (nanos_per(from), nanos_per(to));
+    if from_nanos % to_nanos != 0 {
+        return Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!("Lossy temporal unit conversion from {from} to {to}"),
+        ));
+    }
+    value.checked_mul(from_nanos / to_nanos).ok_or_else(|| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("Temporal value {value} overflows when converted from {from} to {to}"),
+        )
+    })
 }

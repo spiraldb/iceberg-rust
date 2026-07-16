@@ -18,55 +18,57 @@
 //! The module contains the file writer for the vortex file format.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use arrow_arith::aggregate::{
-    max, max_binary, max_boolean, max_string, min, min_binary, min_boolean, min_string,
-};
-use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, Time64MicrosecondArray,
-    TimestampMicrosecondArray, TimestampNanosecondArray,
-};
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef as ArrowSchemaRef;
 use bytes::Bytes;
-use vortex::array::arrays::ChunkedArray;
+use futures::channel::mpsc;
+use futures::{SinkExt, StreamExt};
 use vortex::array::arrow::FromArrowArray;
-use vortex::array::{ArrayRef, IntoArray};
-use vortex::dtype::DType;
+use vortex::array::stats::StatsSet;
+use vortex::array::stream::ArrayStreamAdapter;
+use vortex::array::ArrayRef;
 use vortex::dtype::arrow::FromArrowType;
-use vortex::file::WriteOptionsSessionExt;
+use vortex::dtype::extension::Matcher;
+use vortex::dtype::{DType, Nullability, PType};
+use vortex::expr::stats::{Precision, Stat};
+use vortex::extension::datetime::{AnyTemporal, TimeUnit};
+use vortex::file::{WriteOptionsSessionExt, WriteStrategyBuilder, WriteSummary};
+use vortex::io::{IoBuf, VortexWrite};
+use vortex::layout::LayoutStrategy;
+use vortex::scalar::Scalar;
+use vortex::session::VortexSession;
 
 use super::{FileWriter, FileWriterBuilder};
-use crate::Result;
-use crate::arrow::{FieldMatchMode, NanValueCountVisitor, to_iceberg_error, vortex_session};
-use crate::io::OutputFile;
+use crate::arrow::{convert_temporal_value, to_iceberg_error, vortex_session};
+use crate::io::{FileWrite, OutputFile};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, PrimitiveLiteral, PrimitiveType,
     SchemaRef, Struct, Type,
 };
+use crate::{Error, ErrorKind, Result};
 
 /// VortexWriterBuilder is used to build a [`VortexWriter`].
 #[derive(Clone, Debug)]
 pub struct VortexWriterBuilder {
     schema: SchemaRef,
-    match_mode: FieldMatchMode,
+    session: VortexSession,
 }
 
 impl VortexWriterBuilder {
     /// Create a new `VortexWriterBuilder`.
+    ///
+    /// The builder holds a [`VortexSession`] shared by all writers it builds.
+    /// The session captures the current tokio runtime handle at construction
+    /// time, so the builder must be created from within the runtime that will
+    /// drive the writes.
     pub fn new(schema: SchemaRef) -> Self {
         Self {
             schema,
-            match_mode: FieldMatchMode::Id,
+            session: vortex_session(),
         }
-    }
-
-    /// Set the field match mode used to map Arrow fields to Iceberg fields.
-    ///
-    /// Defaults to [`FieldMatchMode::Id`]. Use [`FieldMatchMode::Name`] when the
-    /// incoming Arrow schema does not carry Iceberg field-id metadata.
-    pub fn with_match_mode(mut self, match_mode: FieldMatchMode) -> Self {
-        self.match_mode = match_mode;
-        self
     }
 }
 
@@ -76,55 +78,139 @@ impl FileWriterBuilder for VortexWriterBuilder {
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
         Ok(VortexWriter {
             schema: self.schema.clone(),
+            session: self.session.clone(),
             output_file,
-            batches: Vec::new(),
+            inner: None,
             current_row_num: 0,
-            buffered_size: 0,
-            nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
         })
     }
 }
 
 /// `VortexWriter` writes arrow data into vortex files on storage.
 ///
-/// Vortex files are written in a single pass at close time, so incoming record
-/// batches are buffered in memory until [`FileWriter::close`] is called.
+/// Record batches are streamed into a vortex file writer running as a
+/// background task, so data is compressed and flushed to storage as it
+/// arrives instead of being buffered until close.
 pub struct VortexWriter {
     schema: SchemaRef,
+    session: VortexSession,
     output_file: OutputFile,
-    batches: Vec<RecordBatch>,
+    inner: Option<StreamingWriter>,
     current_row_num: usize,
-    buffered_size: usize,
-    nan_value_count_visitor: NanValueCountVisitor,
+}
+
+/// The state of an in-progress vortex file write.
+///
+/// Vortex's push-based writer is not `Send`, so instead of holding it in
+/// place the batches are sent through a bounded channel to a spawned task
+/// that owns the write end-to-end and returns the [`WriteSummary`] when
+/// finished. The channel is bounded so the task applies backpressure instead
+/// of buffering batches.
+struct StreamingWriter {
+    arrow_schema: ArrowSchemaRef,
+    batches: mpsc::Sender<ArrayRef>,
+    task: tokio::task::JoinHandle<Result<WriteSummary>>,
+    bytes_written: Arc<AtomicU64>,
+    strategy: Arc<dyn LayoutStrategy>,
+}
+
+impl StreamingWriter {
+    /// Awaits the background task after a failure to surface its error.
+    async fn task_error(self) -> Error {
+        match self.task.await {
+            Ok(Ok(_)) => Error::new(
+                ErrorKind::Unexpected,
+                "Vortex write task stopped accepting batches but reported success",
+            ),
+            Ok(Err(err)) => err,
+            Err(err) => {
+                Error::new(ErrorKind::Unexpected, "Vortex write task panicked").with_source(err)
+            }
+        }
+    }
 }
 
 impl VortexWriter {
-    fn to_data_file_builder(&self, written_size: usize) -> Result<DataFileBuilder> {
-        // Compute value/null counts and min/max bounds for top-level primitive
-        // fields directly from the buffered arrow batches. Nested fields are
-        // left unset; metrics evaluators treat missing entries as
-        // "rows might match".
+    async fn start(&self, arrow_schema: ArrowSchemaRef) -> Result<StreamingWriter> {
+        let dtype = DType::from_arrow(arrow_schema.clone());
+        let file = self.output_file.writer().await?;
+        let bytes_written = Arc::new(AtomicU64::new(0));
+        let strategy = WriteStrategyBuilder::default().build();
+
+        let (batches, receiver) = mpsc::channel::<ArrayRef>(1);
+        let stream = ArrayStreamAdapter::new(dtype, receiver.map(Ok));
+        let write_options = self
+            .session
+            .write_options()
+            .with_strategy(Arc::clone(&strategy));
+
+        let mut sink = FileWriteSink {
+            file,
+            bytes_written: Arc::clone(&bytes_written),
+        };
+        let task = tokio::spawn(async move {
+            let summary = write_options
+                .write(&mut sink, stream)
+                .await
+                .map_err(to_iceberg_error)?;
+            // The vortex writer flushes but does not close its sink; finalize
+            // the iceberg output file explicitly.
+            sink.file.close().await?;
+            Ok(summary)
+        });
+
+        Ok(StreamingWriter {
+            arrow_schema,
+            batches,
+            task,
+            bytes_written,
+            strategy,
+        })
+    }
+
+    fn data_file_builder(
+        &self,
+        summary: &WriteSummary,
+        arrow_schema: &ArrowSchemaRef,
+    ) -> Result<DataFileBuilder> {
+        let record_count = summary.row_count();
+
+        // Take value/null/NaN counts and min/max bounds for top-level
+        // primitive fields from the statistics collected by the vortex writer.
+        // Nested fields are left unset; metrics evaluators treat missing
+        // entries as "rows might match".
         let mut value_counts: HashMap<i32, u64> = HashMap::new();
         let mut null_value_counts: HashMap<i32, u64> = HashMap::new();
+        let mut nan_value_counts: HashMap<i32, u64> = HashMap::new();
         let mut lower_bounds: HashMap<i32, Datum> = HashMap::new();
         let mut upper_bounds: HashMap<i32, Datum> = HashMap::new();
-        for batch in &self.batches {
-            for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-                let Some(iceberg_field) = self.schema.field_by_name(field.name()) else {
-                    continue;
-                };
-                let Type::Primitive(primitive_type) = iceberg_field.field_type.as_ref() else {
-                    continue;
-                };
-                *value_counts.entry(iceberg_field.id).or_insert(0) += column.len() as u64;
-                *null_value_counts.entry(iceberg_field.id).or_insert(0) +=
-                    column.null_count() as u64;
-                if let Some((min_datum, max_datum)) =
-                    column_min_max(column.as_ref(), primitive_type)
-                {
-                    update_bound_min(&mut lower_bounds, iceberg_field.id, min_datum);
-                    update_bound_max(&mut upper_bounds, iceberg_field.id, max_datum);
-                }
+        let file_stats = summary.footer().statistics();
+        for (index, field) in arrow_schema.fields().iter().enumerate() {
+            let Some(iceberg_field) = self.schema.field_by_name(field.name()) else {
+                continue;
+            };
+            let Type::Primitive(primitive_type) = iceberg_field.field_type.as_ref() else {
+                continue;
+            };
+            // Top-level columns hold exactly one value per row.
+            value_counts.insert(iceberg_field.id, record_count);
+            let Some(stats) = file_stats.filter(|stats| index < stats.stats_sets().len()) else {
+                continue;
+            };
+            let (stats_set, field_dtype) = stats.get(index);
+            if let Some(null_count) = exact_count(stats_set, Stat::NullCount) {
+                null_value_counts.insert(iceberg_field.id, null_count);
+            }
+            if matches!(primitive_type, PrimitiveType::Float | PrimitiveType::Double)
+                && let Some(nan_count) = exact_count(stats_set, Stat::NaNCount)
+            {
+                nan_value_counts.insert(iceberg_field.id, nan_count);
+            }
+            if let Some(min) = stat_bound(stats_set, Stat::Min, field_dtype, primitive_type) {
+                lower_bounds.insert(iceberg_field.id, min);
+            }
+            if let Some(max) = stat_bound(stats_set, Stat::Max, field_dtype, primitive_type) {
+                upper_bounds.insert(iceberg_field.id, max);
             }
         }
 
@@ -134,11 +220,11 @@ impl VortexWriter {
             .file_path(self.output_file.location().to_string())
             .file_format(DataFileFormat::Vortex)
             .partition(Struct::empty())
-            .record_count(self.current_row_num as u64)
-            .file_size_in_bytes(written_size as u64)
+            .record_count(record_count)
+            .file_size_in_bytes(summary.size())
             .value_counts(value_counts)
             .null_value_counts(null_value_counts)
-            .nan_value_counts(self.nan_value_count_visitor.nan_value_counts.clone())
+            .nan_value_counts(nan_value_counts)
             .lower_bounds(lower_bounds)
             .upper_bounds(upper_bounds);
         // Vortex files can be split at arbitrary row offsets, so no physical
@@ -148,128 +234,89 @@ impl VortexWriter {
     }
 }
 
-fn update_bound_min(bounds: &mut HashMap<i32, Datum>, field_id: i32, datum: Datum) {
-    bounds
-        .entry(field_id)
-        .and_modify(|entry| {
-            if *entry > datum {
-                *entry = datum.clone();
-            }
-        })
-        .or_insert(datum);
-}
-
-fn update_bound_max(bounds: &mut HashMap<i32, Datum>, field_id: i32, datum: Datum) {
-    bounds
-        .entry(field_id)
-        .and_modify(|entry| {
-            if *entry < datum {
-                *entry = datum.clone();
-            }
-        })
-        .or_insert(datum);
-}
-
-/// Computes the min and max values of an arrow column as iceberg [`Datum`]s.
+/// Extracts an exact count statistic (null or NaN counts) as a u64.
 ///
-/// Returns `None` when the column is empty or all-null, or when its arrow type
-/// does not match the canonical arrow representation of the iceberg type, in
-/// which case no bounds are recorded for the field.
-fn column_min_max(column: &dyn Array, primitive_type: &PrimitiveType) -> Option<(Datum, Datum)> {
+/// Inexact counts are ignored: unlike bounds, a count that is merely bounded
+/// in one direction cannot be recorded in iceberg metrics.
+fn exact_count(stats: &StatsSet, stat: Stat) -> Option<u64> {
+    let Precision::Exact(value) = stats.get(stat) else {
+        return None;
+    };
+    let scalar = Scalar::try_new(
+        DType::Primitive(PType::U64, Nullability::Nullable),
+        Some(value),
+    )
+    .ok()?;
+    scalar.as_primitive_opt()?.typed_value::<u64>()
+}
+
+/// Converts a min/max statistic into an iceberg bound [`Datum`].
+///
+/// Truncated variable-length statistics remain sound bounds: the min is
+/// prefix-truncated (still a lower bound) and the max is upper-adjusted or
+/// absent, so both exact and inexact values are used.
+fn stat_bound(
+    stats: &StatsSet,
+    stat: Stat,
+    field_dtype: &DType,
+    primitive_type: &PrimitiveType,
+) -> Option<Datum> {
+    let value = stats.get(stat).into_inner()?;
+    let scalar = Scalar::try_new(field_dtype.as_nullable(), Some(value)).ok()?;
+    vortex_scalar_to_datum(&scalar, primitive_type)
+}
+
+/// Converts a vortex [`Scalar`] into an iceberg [`Datum`] of the given
+/// primitive type.
+///
+/// Returns `None` for null scalars, NaN float values (excluded from bounds by
+/// the iceberg spec; NaN counts are tracked separately), and types whose
+/// bounds are not computed (`Uuid`, `Fixed`).
+fn vortex_scalar_to_datum(scalar: &Scalar, primitive_type: &PrimitiveType) -> Option<Datum> {
     match primitive_type {
-        PrimitiveType::Boolean => {
-            let array = column.as_any().downcast_ref::<BooleanArray>()?;
-            Some((
-                Datum::bool(min_boolean(array)?),
-                Datum::bool(max_boolean(array)?),
-            ))
-        }
-        PrimitiveType::Int => {
-            let array = column.as_any().downcast_ref::<Int32Array>()?;
-            Some((Datum::int(min(array)?), Datum::int(max(array)?)))
-        }
-        PrimitiveType::Long => {
-            let array = column.as_any().downcast_ref::<Int64Array>()?;
-            Some((Datum::long(min(array)?), Datum::long(max(array)?)))
-        }
+        PrimitiveType::Boolean => Some(Datum::bool(scalar.as_bool_opt()?.value()?)),
+        PrimitiveType::Int => Some(Datum::int(scalar.as_primitive_opt()?.typed_value::<i32>()?)),
+        PrimitiveType::Long => Some(Datum::long(scalar.as_primitive_opt()?.typed_value::<i64>()?)),
         PrimitiveType::Float => {
-            let array = column.as_any().downcast_ref::<Float32Array>()?;
-            let (min_value, max_value) = float_min_max(array.iter(), |value| value.is_nan())?;
-            Some((Datum::float(min_value), Datum::float(max_value)))
+            let value = scalar.as_primitive_opt()?.typed_value::<f32>()?;
+            (!value.is_nan()).then(|| Datum::float(value))
         }
         PrimitiveType::Double => {
-            let array = column.as_any().downcast_ref::<Float64Array>()?;
-            let (min_value, max_value) = float_min_max(array.iter(), |value| value.is_nan())?;
-            Some((Datum::double(min_value), Datum::double(max_value)))
+            let value = scalar.as_primitive_opt()?.typed_value::<f64>()?;
+            (!value.is_nan()).then(|| Datum::double(value))
         }
         PrimitiveType::Date => {
-            let array = column.as_any().downcast_ref::<Date32Array>()?;
-            Some((Datum::date(min(array)?), Datum::date(max(array)?)))
+            let days = temporal_value(scalar, TimeUnit::Days)?;
+            Some(Datum::date(i32::try_from(days).ok()?))
         }
         PrimitiveType::Time => {
-            let array = column.as_any().downcast_ref::<Time64MicrosecondArray>()?;
-            Some((
-                Datum::time_micros(min(array)?).ok()?,
-                Datum::time_micros(max(array)?).ok()?,
-            ))
+            Datum::time_micros(temporal_value(scalar, TimeUnit::Microseconds)?).ok()
         }
-        PrimitiveType::Timestamp => {
-            let array = column
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()?;
-            Some((
-                Datum::timestamp_micros(min(array)?),
-                Datum::timestamp_micros(max(array)?),
-            ))
-        }
-        PrimitiveType::Timestamptz => {
-            let array = column
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()?;
-            Some((
-                Datum::timestamptz_micros(min(array)?),
-                Datum::timestamptz_micros(max(array)?),
-            ))
-        }
-        PrimitiveType::TimestampNs => {
-            let array = column.as_any().downcast_ref::<TimestampNanosecondArray>()?;
-            Some((
-                Datum::timestamp_nanos(min(array)?),
-                Datum::timestamp_nanos(max(array)?),
-            ))
-        }
-        PrimitiveType::TimestamptzNs => {
-            let array = column.as_any().downcast_ref::<TimestampNanosecondArray>()?;
-            Some((
-                Datum::timestamptz_nanos(min(array)?),
-                Datum::timestamptz_nanos(max(array)?),
-            ))
-        }
-        PrimitiveType::String => {
-            let array = column.as_any().downcast_ref::<StringArray>()?;
-            Some((
-                Datum::string(min_string(array)?),
-                Datum::string(max_string(array)?),
-            ))
-        }
-        PrimitiveType::Binary => {
-            let array = column.as_any().downcast_ref::<BinaryArray>()?;
-            Some((
-                Datum::binary(min_binary(array)?.iter().copied()),
-                Datum::binary(max_binary(array)?.iter().copied()),
-            ))
-        }
+        PrimitiveType::Timestamp => Some(Datum::timestamp_micros(temporal_value(
+            scalar,
+            TimeUnit::Microseconds,
+        )?)),
+        PrimitiveType::Timestamptz => Some(Datum::timestamptz_micros(temporal_value(
+            scalar,
+            TimeUnit::Microseconds,
+        )?)),
+        PrimitiveType::TimestampNs => Some(Datum::timestamp_nanos(temporal_value(
+            scalar,
+            TimeUnit::Nanoseconds,
+        )?)),
+        PrimitiveType::TimestamptzNs => Some(Datum::timestamptz_nanos(temporal_value(
+            scalar,
+            TimeUnit::Nanoseconds,
+        )?)),
+        PrimitiveType::String => Some(Datum::string(scalar.as_utf8_opt()?.value()?.as_str())),
+        PrimitiveType::Binary => Some(Datum::binary(
+            scalar.as_binary_opt()?.value()?.as_slice().iter().copied(),
+        )),
         PrimitiveType::Decimal { .. } => {
-            let array = column.as_any().downcast_ref::<Decimal128Array>()?;
-            Some((
-                Datum::new(
-                    primitive_type.clone(),
-                    PrimitiveLiteral::Int128(min(array)?),
-                ),
-                Datum::new(
-                    primitive_type.clone(),
-                    PrimitiveLiteral::Int128(max(array)?),
-                ),
+            let value = scalar.as_decimal_opt()?.decimal_value()?.cast::<i128>()?;
+            Some(Datum::new(
+                primitive_type.clone(),
+                PrimitiveLiteral::Int128(value),
             ))
         }
         // Uuid and Fixed bounds are not computed.
@@ -277,26 +324,57 @@ fn column_min_max(column: &dyn Array, primitive_type: &PrimitiveType) -> Option<
     }
 }
 
-/// Computes the min and max of a float column, skipping nulls and NaN values
-/// as required by the iceberg spec (NaN counts are tracked separately).
-fn float_min_max<T: PartialOrd + Copy>(
-    values: impl Iterator<Item = Option<T>>,
-    is_nan: impl Fn(T) -> bool,
-) -> Option<(T, T)> {
-    let mut bounds: Option<(T, T)> = None;
-    for value in values.flatten() {
-        if is_nan(value) {
-            continue;
+/// Extracts a temporal scalar's storage value converted to the given unit.
+///
+/// Vortex stores temporal columns as extension types whose metadata carries
+/// the time unit; plain integer columns are assumed to already be in the
+/// requested unit.
+fn temporal_value(scalar: &Scalar, unit: TimeUnit) -> Option<i64> {
+    match scalar.dtype() {
+        DType::Extension(ext) => {
+            let metadata = AnyTemporal::try_match(ext)?;
+            let storage = scalar.as_extension_opt()?.to_storage_scalar();
+            let storage = storage.as_primitive_opt()?;
+            let value = match storage.ptype() {
+                PType::I32 => i64::from(storage.typed_value::<i32>()?),
+                PType::I64 => storage.typed_value::<i64>()?,
+                _ => return None,
+            };
+            convert_temporal_value(value, metadata.time_unit(), unit).ok()
         }
-        bounds = Some(match bounds {
-            None => (value, value),
-            Some((min_value, max_value)) => (
-                if value < min_value { value } else { min_value },
-                if value > max_value { value } else { max_value },
-            ),
-        });
+        DType::Primitive(PType::I32, _) => {
+            scalar.as_primitive_opt()?.typed_value::<i32>().map(i64::from)
+        }
+        DType::Primitive(PType::I64, _) => scalar.as_primitive_opt()?.typed_value::<i64>(),
+        _ => None,
     }
-    bounds
+}
+
+/// Adapts an iceberg [`FileWrite`] into a [`VortexWrite`] sink, counting the
+/// bytes flushed to storage.
+struct FileWriteSink {
+    file: Box<dyn FileWrite>,
+    bytes_written: Arc<AtomicU64>,
+}
+
+impl VortexWrite for FileWriteSink {
+    async fn write_all<B: IoBuf>(&mut self, buffer: B) -> std::io::Result<B> {
+        self.file
+            .write(Bytes::copy_from_slice(buffer.as_slice()))
+            .await
+            .map_err(std::io::Error::other)?;
+        self.bytes_written
+            .fetch_add(buffer.as_slice().len() as u64, Ordering::Relaxed);
+        Ok(buffer)
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl FileWriter for VortexWriter {
@@ -306,43 +384,42 @@ impl FileWriter for VortexWriter {
             return Ok(());
         }
 
+        if self.inner.is_none() {
+            self.inner = Some(self.start(batch.schema()).await?);
+        }
+        let inner = self.inner.as_mut().expect("writer started above");
+
+        let array = ArrayRef::from_arrow(batch.clone(), false).map_err(to_iceberg_error)?;
+        if inner.batches.send(array).await.is_err() {
+            // The background task exited early; surface its error.
+            let inner = self.inner.take().expect("writer started above");
+            return Err(inner.task_error().await);
+        }
         self.current_row_num += batch.num_rows();
-        self.buffered_size += batch.get_array_memory_size();
-        self.nan_value_count_visitor
-            .compute(self.schema.clone(), batch.clone())?;
-        self.batches.push(batch.clone());
 
         Ok(())
     }
 
-    async fn close(self) -> Result<Vec<DataFileBuilder>> {
-        if self.batches.is_empty() {
+    async fn close(mut self) -> Result<Vec<DataFileBuilder>> {
+        let Some(inner) = self.inner.take() else {
             return Ok(vec![]);
-        }
+        };
 
-        let dtype = DType::from_arrow(self.batches[0].schema());
-        let chunks = self
-            .batches
-            .iter()
-            .map(|batch| ArrayRef::from_arrow(batch.clone(), false))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(to_iceberg_error)?;
-        let array = ChunkedArray::try_new(chunks, dtype)
-            .map_err(to_iceberg_error)?
-            .into_array();
-
-        let session = vortex_session();
-        let mut buffer: Vec<u8> = Vec::new();
-        session
-            .write_options()
-            .write(&mut buffer, array.to_array_stream())
+        let StreamingWriter {
+            arrow_schema,
+            batches,
+            task,
+            ..
+        } = inner;
+        // Close the input channel to signal end-of-stream to the write task.
+        drop(batches);
+        let summary = task
             .await
-            .map_err(to_iceberg_error)?;
+            .map_err(|err| {
+                Error::new(ErrorKind::Unexpected, "Vortex write task panicked").with_source(err)
+            })??;
 
-        let written_size = buffer.len();
-        self.output_file.write(Bytes::from(buffer)).await?;
-
-        Ok(vec![self.to_data_file_builder(written_size)?])
+        Ok(vec![self.data_file_builder(&summary, &arrow_schema)?])
     }
 }
 
@@ -356,9 +433,15 @@ impl super::super::CurrentFileStatus for VortexWriter {
     }
 
     fn current_written_size(&self) -> usize {
-        // The vortex file is written in one shot at close time, so report the
-        // in-memory size of the buffered batches. This overestimates the final
-        // (compressed) file size, which makes size-based rolling conservative.
-        self.buffered_size
+        // Bytes already flushed to storage plus bytes buffered by the layout
+        // strategy. This underestimates the final file size by the footer,
+        // which is only serialized at close time.
+        self.inner
+            .as_ref()
+            .map(|inner| {
+                (inner.bytes_written.load(Ordering::Relaxed) + inner.strategy.buffered_bytes())
+                    as usize
+            })
+            .unwrap_or(0)
     }
 }

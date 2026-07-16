@@ -50,7 +50,7 @@ use super::DEFAULT_RANGE_FETCH_CONCURRENCY;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::CountingFileRead;
-use crate::arrow::{to_iceberg_error, vortex_session};
+use crate::arrow::{convert_temporal_value, to_iceberg_error, vortex_session};
 use crate::expr::{BoundPredicate, BoundReference, PredicateOperator};
 use crate::io::{FileIO, FileRead};
 use crate::metadata_columns::RESERVED_FIELD_ID_FILE;
@@ -601,34 +601,6 @@ fn temporal_scalar(file_dtype: &DType, value: i64, value_unit: TimeUnit) -> Resu
             format!("Cannot compare a temporal predicate literal to a column of type {dtype}"),
         )),
     }
-}
-
-/// Losslessly converts a temporal value between units; conversions that would
-/// lose precision (e.g. microseconds to seconds) are rejected.
-fn convert_temporal_value(value: i64, from: TimeUnit, to: TimeUnit) -> Result<i64> {
-    fn nanos_per(unit: TimeUnit) -> i64 {
-        match unit {
-            TimeUnit::Nanoseconds => 1,
-            TimeUnit::Microseconds => 1_000,
-            TimeUnit::Milliseconds => 1_000_000,
-            TimeUnit::Seconds => 1_000_000_000,
-            TimeUnit::Days => 86_400_000_000_000,
-        }
-    }
-
-    let (from_nanos, to_nanos) = (nanos_per(from), nanos_per(to));
-    if from_nanos % to_nanos != 0 {
-        return Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            format!("Lossy temporal unit conversion from {from} to {to} in predicate literal"),
-        ));
-    }
-    value.checked_mul(from_nanos / to_nanos).ok_or_else(|| {
-        Error::new(
-            ErrorKind::DataInvalid,
-            format!("Temporal value {value} overflows when converted from {from} to {to}"),
-        )
-    })
 }
 
 #[cfg(test)]
