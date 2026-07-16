@@ -28,12 +28,12 @@ use futures::channel::mpsc;
 use futures::{SinkExt, StreamExt};
 use vortex::array::ArrayRef;
 use vortex::array::arrow::FromArrowArray;
-use vortex::array::stats::StatsSet;
+use vortex::array::stats::TypedStatsSetRef;
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::dtype::arrow::FromArrowType;
 use vortex::dtype::extension::Matcher;
-use vortex::dtype::{DType, Nullability, PType};
-use vortex::expr::stats::{Precision, Stat};
+use vortex::dtype::{DType, PType};
+use vortex::expr::stats::{Stat, StatsProvider, StatsProviderExt};
 use vortex::extension::datetime::{AnyTemporal, TimeUnit};
 use vortex::file::{WriteOptionsSessionExt, WriteStrategyBuilder, WriteSummary};
 use vortex::io::{IoBuf, VortexWrite};
@@ -194,18 +194,19 @@ impl VortexWriter {
                 continue;
             };
             let (stats_set, field_dtype) = stats.get(index);
-            if let Some(null_count) = exact_count(stats_set, Stat::NullCount) {
+            let typed_stats = stats_set.as_typed_ref(field_dtype);
+            if let Some(null_count) = typed_stats.get_as::<u64>(Stat::NullCount).as_exact() {
                 null_value_counts.insert(iceberg_field.id, null_count);
             }
             if matches!(primitive_type, PrimitiveType::Float | PrimitiveType::Double)
-                && let Some(nan_count) = exact_count(stats_set, Stat::NaNCount)
+                && let Some(nan_count) = typed_stats.get_as::<u64>(Stat::NaNCount).as_exact()
             {
                 nan_value_counts.insert(iceberg_field.id, nan_count);
             }
-            if let Some(min) = stat_bound(stats_set, Stat::Min, field_dtype, primitive_type) {
+            if let Some(min) = stat_bound(&typed_stats, Stat::Min, primitive_type) {
                 lower_bounds.insert(iceberg_field.id, min);
             }
-            if let Some(max) = stat_bound(stats_set, Stat::Max, field_dtype, primitive_type) {
+            if let Some(max) = stat_bound(&typed_stats, Stat::Max, primitive_type) {
                 upper_bounds.insert(iceberg_field.id, max);
             }
         }
@@ -230,36 +231,18 @@ impl VortexWriter {
     }
 }
 
-/// Extracts an exact count statistic (null or NaN counts) as a u64.
-///
-/// Inexact counts are ignored: unlike bounds, a count that is merely bounded
-/// in one direction cannot be recorded in iceberg metrics.
-fn exact_count(stats: &StatsSet, stat: Stat) -> Option<u64> {
-    let Precision::Exact(value) = stats.get(stat) else {
-        return None;
-    };
-    let scalar = Scalar::try_new(
-        DType::Primitive(PType::U64, Nullability::Nullable),
-        Some(value),
-    )
-    .ok()?;
-    scalar.as_primitive_opt()?.typed_value::<u64>()
-}
-
 /// Converts a min/max statistic into an iceberg bound [`Datum`].
 ///
 /// Truncated variable-length statistics remain sound bounds: the min is
 /// prefix-truncated (still a lower bound) and the max is upper-adjusted or
 /// absent, so both exact and inexact values are used.
 fn stat_bound(
-    stats: &StatsSet,
+    stats: &TypedStatsSetRef,
     stat: Stat,
-    field_dtype: &DType,
     primitive_type: &PrimitiveType,
 ) -> Option<Datum> {
     let value = stats.get(stat).into_inner()?;
-    let scalar = Scalar::try_new(field_dtype.as_nullable(), Some(value)).ok()?;
-    vortex_scalar_to_datum(&scalar, primitive_type)
+    vortex_scalar_to_datum(value, primitive_type)
 }
 
 /// Converts a vortex [`Scalar`] into an iceberg [`Datum`] of the given
@@ -268,7 +251,7 @@ fn stat_bound(
 /// Returns `None` for null scalars, NaN float values (excluded from bounds by
 /// the iceberg spec; NaN counts are tracked separately), and types whose
 /// bounds are not computed (`Uuid`, `Fixed`).
-fn vortex_scalar_to_datum(scalar: &Scalar, primitive_type: &PrimitiveType) -> Option<Datum> {
+fn vortex_scalar_to_datum(scalar: Scalar, primitive_type: &PrimitiveType) -> Option<Datum> {
     match primitive_type {
         PrimitiveType::Boolean => Some(Datum::bool(scalar.as_bool_opt()?.value()?)),
         PrimitiveType::Int => Some(Datum::int(scalar.as_primitive_opt()?.typed_value::<i32>()?)),
@@ -327,7 +310,7 @@ fn vortex_scalar_to_datum(scalar: &Scalar, primitive_type: &PrimitiveType) -> Op
 /// Vortex stores temporal columns as extension types whose metadata carries
 /// the time unit; plain integer columns are assumed to already be in the
 /// requested unit.
-fn temporal_value(scalar: &Scalar, unit: TimeUnit) -> Option<i64> {
+fn temporal_value(scalar: Scalar, unit: TimeUnit) -> Option<i64> {
     match scalar.dtype() {
         DType::Extension(ext) => {
             let metadata = AnyTemporal::try_match(ext)?;
