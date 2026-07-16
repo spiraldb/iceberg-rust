@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"mod":["location_generator","rolling_writer"],"struct":["ParquetWriter","ParquetWriterBuilder"],"trait":["FileWriter","FileWriterBuilder"]};
+window.SIDEBAR_ITEMS = {"mod":["location_generator","rolling_writer"],"struct":["ParquetWriter","ParquetWriterBuilder","VortexWriter","VortexWriterBuilder"],"trait":["FileWriter","FileWriterBuilder"]};
