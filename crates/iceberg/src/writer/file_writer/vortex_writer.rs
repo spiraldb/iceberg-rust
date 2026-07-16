@@ -26,10 +26,10 @@ use arrow_schema::SchemaRef as ArrowSchemaRef;
 use bytes::Bytes;
 use futures::channel::mpsc;
 use futures::{SinkExt, StreamExt};
+use vortex::array::ArrayRef;
 use vortex::array::arrow::FromArrowArray;
 use vortex::array::stats::StatsSet;
 use vortex::array::stream::ArrayStreamAdapter;
-use vortex::array::ArrayRef;
 use vortex::dtype::arrow::FromArrowType;
 use vortex::dtype::extension::Matcher;
 use vortex::dtype::{DType, Nullability, PType};
@@ -272,7 +272,9 @@ fn vortex_scalar_to_datum(scalar: &Scalar, primitive_type: &PrimitiveType) -> Op
     match primitive_type {
         PrimitiveType::Boolean => Some(Datum::bool(scalar.as_bool_opt()?.value()?)),
         PrimitiveType::Int => Some(Datum::int(scalar.as_primitive_opt()?.typed_value::<i32>()?)),
-        PrimitiveType::Long => Some(Datum::long(scalar.as_primitive_opt()?.typed_value::<i64>()?)),
+        PrimitiveType::Long => Some(Datum::long(
+            scalar.as_primitive_opt()?.typed_value::<i64>()?,
+        )),
         PrimitiveType::Float => {
             let value = scalar.as_primitive_opt()?.typed_value::<f32>()?;
             (!value.is_nan()).then(|| Datum::float(value))
@@ -338,9 +340,10 @@ fn temporal_value(scalar: &Scalar, unit: TimeUnit) -> Option<i64> {
             };
             convert_temporal_value(value, metadata.time_unit(), unit).ok()
         }
-        DType::Primitive(PType::I32, _) => {
-            scalar.as_primitive_opt()?.typed_value::<i32>().map(i64::from)
-        }
+        DType::Primitive(PType::I32, _) => scalar
+            .as_primitive_opt()?
+            .typed_value::<i32>()
+            .map(i64::from),
         DType::Primitive(PType::I64, _) => scalar.as_primitive_opt()?.typed_value::<i64>(),
         _ => None,
     }
@@ -409,11 +412,9 @@ impl FileWriter for VortexWriter {
         } = inner;
         // Close the input channel to signal end-of-stream to the write task.
         drop(batches);
-        let summary = task
-            .await
-            .map_err(|err| {
-                Error::new(ErrorKind::Unexpected, "Vortex write task panicked").with_source(err)
-            })??;
+        let summary = task.await.map_err(|err| {
+            Error::new(ErrorKind::Unexpected, "Vortex write task panicked").with_source(err)
+        })??;
 
         Ok(vec![self.data_file_builder(&summary, &arrow_schema)?])
     }
