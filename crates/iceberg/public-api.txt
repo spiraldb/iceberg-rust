@@ -3246,7 +3246,7 @@ pub async fn iceberg::writer::file_writer::VortexWriter::close(self) -> iceberg:
 pub async fn iceberg::writer::file_writer::VortexWriter::write(&mut self, batch: &arrow_array::record_batch::RecordBatch) -> iceberg::Result<()>
 pub struct iceberg::writer::file_writer::VortexWriterBuilder
 impl iceberg::writer::file_writer::VortexWriterBuilder
-pub fn iceberg::writer::file_writer::VortexWriterBuilder::new(schema: iceberg::spec::SchemaRef) -> Self
+pub fn iceberg::writer::file_writer::VortexWriterBuilder::new(schema: iceberg::spec::SchemaRef, session: vortex_session::session::VortexSession) -> Self
 impl core::clone::Clone for iceberg::writer::file_writer::VortexWriterBuilder
 pub fn iceberg::writer::file_writer::VortexWriterBuilder::clone(&self) -> iceberg::writer::file_writer::VortexWriterBuilder
 impl core::fmt::Debug for iceberg::writer::file_writer::VortexWriterBuilder

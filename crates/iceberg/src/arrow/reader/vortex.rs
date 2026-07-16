@@ -616,7 +616,7 @@ mod tests {
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use tempfile::TempDir;
 
-    use crate::arrow::ArrowReaderBuilder;
+    use crate::arrow::{ArrowReaderBuilder, vortex_session};
     use crate::expr::{Bind, Reference};
     use crate::io::FileIO;
     use crate::runtime::Runtime;
@@ -742,7 +742,7 @@ mod tests {
 
     async fn write_test_file(file_path: &str, file_io: &FileIO) -> crate::spec::DataFile {
         let output = file_io.new_output(file_path).unwrap();
-        let mut writer = VortexWriterBuilder::new(test_schema())
+        let mut writer = VortexWriterBuilder::new(test_schema(), vortex_session())
             .build(output)
             .await
             .unwrap();

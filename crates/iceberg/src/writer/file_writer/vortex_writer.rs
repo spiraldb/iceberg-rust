@@ -42,7 +42,7 @@ use vortex::scalar::Scalar;
 use vortex::session::VortexSession;
 
 use super::{FileWriter, FileWriterBuilder};
-use crate::arrow::{convert_temporal_value, to_iceberg_error, vortex_session};
+use crate::arrow::{convert_temporal_value, to_iceberg_error};
 use crate::io::{FileWrite, OutputFile};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, PrimitiveLiteral, PrimitiveType,
@@ -60,15 +60,11 @@ pub struct VortexWriterBuilder {
 impl VortexWriterBuilder {
     /// Create a new `VortexWriterBuilder`.
     ///
-    /// The builder holds a [`VortexSession`] shared by all writers it builds.
-    /// The session captures the current tokio runtime handle at construction
-    /// time, so the builder must be created from within the runtime that will
-    /// drive the writes.
-    pub fn new(schema: SchemaRef) -> Self {
-        Self {
-            schema,
-            session: vortex_session(),
-        }
+    /// The session is shared by all writers the builder builds. It captures
+    /// the current tokio runtime handle at construction time, so it must be
+    /// created from within the runtime that will drive the writes.
+    pub fn new(schema: SchemaRef, session: VortexSession) -> Self {
+        Self { schema, session }
     }
 }
 
