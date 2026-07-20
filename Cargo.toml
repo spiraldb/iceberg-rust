@@ -152,6 +152,11 @@ url = "2.5.7"
 uuid = { version = "1.18", features = ["v7"] }
 volo = "0.10.6"
 volo-thrift = "0.10.8"
-vortex = { version = "0.78", features = ["tokio"] }
+# This matches the version declared by Spiral's Git Vortex checkout.
+vortex = {
+  git = "https://github.com/vortex-data/vortex.git",
+  rev = "c5e075ab7f9babffd32f9592e8e35a1981c5cd49",
+  features = ["tokio"],
+}
 zeroize = "1.7"
 zstd = "0.13.3"
