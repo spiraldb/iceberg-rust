@@ -22,6 +22,9 @@ fn context(table: Table) -> Result<SessionContext> {
 The caller keeps the table's Tokio runtime alive. A provider retains the loaded
 table's schema and snapshot; construct a new provider to observe catalog updates.
 
+Top-level string and binary columns use Arrow view arrays. Nested columns and
+extension storage keep their Iceberg Arrow types.
+
 Scans expose the session's target partition count, with a minimum of two. File
 byte ranges are balanced across consumers and own disjoint Parquet row groups.
 Each consumer has its own reader stream. Decoding runs on the table's CPU

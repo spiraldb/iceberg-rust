@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, StructArray,
+    ArrayRef, BinaryViewArray, BooleanArray, Float64Array, Int32Array, Int64Array,
+    LargeBinaryArray, StringArray, StringViewArray, StructArray,
 };
 use datafusion::arrow::buffer::NullBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -38,7 +39,7 @@ use iceberg::metadata_columns::{
 };
 use iceberg::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Literal, ManifestListWriter,
-    ManifestWriterBuilder, Operation, PrimitiveType, Snapshot, Struct, Summary, Type,
+    ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Snapshot, Struct, Summary, Type,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
@@ -88,10 +89,17 @@ impl Fixture {
             Field::new("flag", DataType::Boolean, true),
             Field::new(
                 "payload",
-                DataType::Struct(vec![Field::new("code", DataType::Int64, true)].into()),
+                DataType::Struct(
+                    vec![
+                        Field::new("code", DataType::Int64, true),
+                        Field::new("text", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
                 true,
             ),
             Field::new("special_float", DataType::Float64, true),
+            Field::new("blob", DataType::Binary, true),
         ]))
         .unwrap();
         let mut table = catalog
@@ -126,12 +134,20 @@ impl Fixture {
             )),
             Arc::new(StructArray::new(
                 payload_fields.clone(),
-                vec![Arc::new(Int64Array::from_iter(
-                    (0..ROWS).map(|id| (id % 5 != 0).then_some(id * 3)),
-                ))],
+                vec![
+                    Arc::new(Int64Array::from_iter(
+                        (0..ROWS).map(|id| (id % 5 != 0).then_some(id * 3)),
+                    )),
+                    Arc::new(StringArray::from_iter(
+                        (0..ROWS).map(|id| (id % 5 != 0).then(|| format!("nested-{id}"))),
+                    )),
+                ],
                 Some(NullBuffer::from_iter((0..ROWS).map(|id| id % 5 != 0))),
             )),
             Arc::new(Float64Array::from(vec![f64::NAN; ROWS as usize])),
+            Arc::new(LargeBinaryArray::from_iter(
+                (0..ROWS).map(|id| (id % 11 != 0).then(|| id.to_le_bytes().to_vec())),
+            )),
         ])
         .unwrap();
         if write {
@@ -186,6 +202,39 @@ impl Fixture {
                 .with_target_partitions(4)
                 .with_batch_size(19),
         )
+    }
+
+    fn evolve_field(&mut self, index: usize, update: impl FnOnce(&mut NestedField)) {
+        let current = self.table.metadata().current_schema();
+        let mut fields = current.as_struct().fields().to_vec();
+        let mut field = fields[index].as_ref().clone();
+        update(&mut field);
+        fields[index] = Arc::new(field);
+        let schema_id = current.schema_id() + 1;
+        let schema = iceberg::spec::Schema::builder()
+            .with_schema_id(schema_id)
+            .with_fields(fields)
+            .build()
+            .unwrap();
+        let metadata = self
+            .table
+            .metadata()
+            .clone()
+            .into_builder(self.table.metadata_location().map(str::to_owned))
+            .add_schema(schema)
+            .unwrap()
+            .set_current_schema(schema_id)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        self.table = Table::builder()
+            .metadata(metadata)
+            .identifier(self.table.identifier().clone())
+            .file_io(self.table.file_io().clone())
+            .runtime(Runtime::current())
+            .build()
+            .unwrap();
     }
 
     async fn add_deletes(&mut self) {
@@ -344,7 +393,16 @@ fn parallel_single_file_scans_preserve_projection_and_row_counts() {
             IcebergTableProvider::try_new(fixture.table.clone().with_runtime(runtime)).unwrap();
         let context = fixture.context();
         let state = context.state();
-        let projection = vec![3, 1, 0];
+        assert_eq!(provider.schema().field(1).data_type(), &DataType::Utf8View);
+        assert_eq!(
+            provider.schema().field(5).data_type(),
+            &DataType::BinaryView
+        );
+        let DataType::Struct(payload) = provider.schema().field(3).data_type().clone() else {
+            unreachable!()
+        };
+        assert_eq!(payload[1].data_type(), &DataType::Utf8);
+        let projection = vec![3, 1, 0, 5];
         let plan = provider
             .scan(&state, Some(&projection), &[], None)
             .await
@@ -362,11 +420,29 @@ fn parallel_single_file_scans_preserve_projection_and_row_counts() {
         for batch in partitions.into_iter().flatten() {
             assert_eq!(batch.schema().field(0).name(), "payload");
             assert_eq!(batch.schema().field(1).name(), "label");
+            assert_eq!(batch.column(1).data_type(), &DataType::Utf8View);
+            assert_eq!(batch.column(3).data_type(), &DataType::BinaryView);
             let column = batch
                 .column(2)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
+            let blobs = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .unwrap();
+            assert_eq!(
+                blobs
+                    .iter()
+                    .map(|value| value.map(<[u8]>::to_vec))
+                    .collect::<Vec<_>>(),
+                column
+                    .values()
+                    .iter()
+                    .map(|id| (id % 11 != 0).then(|| id.to_le_bytes().to_vec()))
+                    .collect::<Vec<_>>()
+            );
             ids.extend(column.values().iter().copied());
         }
         ids.sort_unstable();
@@ -604,7 +680,7 @@ async fn deletes_apply_across_split_ranges_and_unprojected_keys() {
             batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<StringArray>()
+                .downcast_ref::<StringViewArray>()
                 .unwrap()
                 .iter()
                 .map(|value| value.map(str::to_owned))
@@ -622,7 +698,7 @@ async fn deletes_apply_across_split_ranges_and_unprojected_keys() {
 
 #[tokio::test]
 async fn added_columns_and_empty_snapshots_keep_their_schema() {
-    let fixture = Fixture::new(true).await;
+    let mut fixture = Fixture::new(true).await;
     let tx = Transaction::new(&fixture.table);
     let table = tx
         .upgrade_table_version()
@@ -644,14 +720,21 @@ async fn added_columns_and_empty_snapshots_keep_their_schema() {
             Type::Primitive(PrimitiveType::Int),
             Literal::int(7),
         ))
+        .add_column(AddColumn::required(
+            "default_string",
+            PrimitiveType::String.into(),
+            Literal::string("fallback"),
+        ))
         .apply(tx)
         .unwrap()
         .commit(&fixture.catalog)
         .await
         .unwrap();
-    let provider = Arc::new(IcebergTableProvider::try_new(table).unwrap());
+    fixture.table = table;
+    fixture.evolve_field(1, |field| field.name = "renamed_label".to_owned());
+    let provider = Arc::new(IcebergTableProvider::try_new(fixture.table.clone()).unwrap());
     let context = fixture.context();
-    let projection = vec![5];
+    let projection = vec![6];
     let plan = provider
         .scan(&context.state(), Some(&projection), &[], None)
         .await
@@ -667,8 +750,12 @@ async fn added_columns_and_empty_snapshots_keep_their_schema() {
         ),
         (ROWS as usize, ROWS as usize)
     );
-    context.register_table("evolved", provider).unwrap();
-    for filter in ["defaulted = 7", "defaulted > 6"] {
+    context.register_table("evolved", provider.clone()).unwrap();
+    for filter in [
+        "defaulted = 7",
+        "defaulted > 6",
+        "default_string = 'fallback'",
+    ] {
         let batches = context
             .sql(&format!(
                 "SELECT id FROM evolved WHERE {filter} ORDER BY id"
@@ -692,52 +779,66 @@ async fn added_columns_and_empty_snapshots_keep_their_schema() {
             .collect::<Vec<_>>();
         assert_eq!(ids, (0..ROWS).collect::<Vec<_>>(), "filter: {filter}");
     }
-
+    let batches = context
+        .sql("SELECT renamed_label, default_string FROM evolved ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let labels = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap()
+                .iter()
+                .map(|value| value.map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let expected = fixture
+        .batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .map(|value| value.map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert_eq!(labels, expected);
+    for batch in batches {
+        assert!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap()
+                .iter()
+                .all(|value| value == Some("fallback"))
+        );
+    }
     let empty = Fixture::new(false).await;
     let provider = IcebergTableProvider::try_new(empty.table).unwrap();
     let plan = provider
         .scan(&context.state(), None, &[], None)
         .await
         .unwrap();
-    assert_eq!(plan.schema(), empty.batch.schema());
+    assert_eq!(
+        plan.schema().as_ref(),
+        &iceberg::arrow::schema_with_view_types(empty.batch.schema().as_ref())
+    );
     assert_eq!(plan.output_partitioning().partition_count(), 4);
     assert!(collect(plan, context.task_ctx()).await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn promoted_integer_predicates_preserve_out_of_range_literals() {
-    let fixture = Fixture::new_with_id_type(true, DataType::Int32).await;
-    let current = fixture.table.metadata().current_schema();
-    let mut fields = current.as_struct().fields().to_vec();
-    let mut id = fields[0].as_ref().clone();
-    id.field_type = Box::new(Type::Primitive(PrimitiveType::Long));
-    fields[0] = Arc::new(id);
-    let schema_id = current.schema_id() + 1;
-    let schema = iceberg::spec::Schema::builder()
-        .with_schema_id(schema_id)
-        .with_fields(fields)
-        .build()
-        .unwrap();
-    let metadata = fixture
-        .table
-        .metadata()
-        .clone()
-        .into_builder(fixture.table.metadata_location().map(str::to_owned))
-        .add_schema(schema)
-        .unwrap()
-        .set_current_schema(schema_id)
-        .unwrap()
-        .build()
-        .unwrap()
-        .metadata;
-    let table = Table::builder()
-        .metadata(metadata)
-        .identifier(fixture.table.identifier().clone())
-        .file_io(fixture.table.file_io().clone())
-        .runtime(Runtime::current())
-        .build()
-        .unwrap();
-    let provider = Arc::new(IcebergTableProvider::try_new(table).unwrap());
+    let mut fixture = Fixture::new_with_id_type(true, DataType::Int32).await;
+    fixture.evolve_field(0, |field| *field.field_type = PrimitiveType::Long.into());
+    let provider = Arc::new(IcebergTableProvider::try_new(fixture.table.clone()).unwrap());
     let context = fixture.context();
     context
         .register_table("promoted", provider.clone())

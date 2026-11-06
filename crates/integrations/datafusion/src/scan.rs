@@ -181,6 +181,7 @@ impl ExecutionPlan for IcebergScan {
             .with_batch_size(self.batch_size)
             .with_data_file_concurrency_limit(1)
             .with_background_reads(true)
+            .with_view_types(true)
             .with_compute_time_observer(move |elapsed| compute.add_duration(elapsed))
             .build()
             .read(futures::stream::iter(tasks.into_iter().map(Ok)).boxed())

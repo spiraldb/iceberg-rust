@@ -39,11 +39,11 @@ use super::{
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
     find_leaf_by_field_id,
 };
-use crate::arrow::build_partition_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
+use crate::arrow::{build_partition_constant, schema_with_view_types};
 use crate::encryption::StandardKeyMetadata;
 use crate::error::{Result, invalid_data};
 use crate::expr::BoundPredicate;
@@ -70,6 +70,7 @@ impl ArrowReader {
 
         let task_reader = FileScanTaskReader {
             batch_size: self.batch_size,
+            view_types: self.view_types,
             file_io: self.file_io,
             delete_file_loader: self
                 .delete_file_loader
@@ -137,6 +138,7 @@ const PRUNABLE_METADATA_FIELDS: &[i32] = &[
 #[derive(Clone)]
 struct FileScanTaskReader {
     batch_size: Option<usize>,
+    view_types: bool,
     file_io: FileIO,
     delete_file_loader: CachingDeleteFileLoader,
     row_group_filtering_enabled: bool,
@@ -239,6 +241,7 @@ impl FileScanTaskReader {
             &task,
             missing_field_ids,
             install_row_number,
+            self.view_types,
         )?;
 
         // Build the stream reader, reusing the already-opened file reader
@@ -364,7 +367,8 @@ impl FileScanTaskReader {
         // that come back from the file, such as type promotion, default column insertion,
         // column re-ordering, partition constants, and virtual field addition (like _file)
         let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids())
+                .with_view_types(self.view_types);
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
@@ -693,6 +697,7 @@ impl FileScanTaskReader {
         task: &FileScanTask,
         missing_field_ids: bool,
         install_row_number: bool,
+        view_types: bool,
     ) -> Result<ArrowReaderMetadata> {
         // Schema resolution follows the Iceberg Column Projection rule:
         // "Columns in Iceberg data files are selected by field id."
@@ -719,10 +724,16 @@ impl FileScanTaskReader {
             coerce_int96_timestamps(arrow_metadata.schema(), task.schema())
         {
             coerced
-        } else if install_row_number {
+        } else if install_row_number || view_types {
             Arc::clone(arrow_metadata.schema())
         } else {
             return Ok(arrow_metadata);
+        };
+
+        let arrow_schema = if view_types {
+            Arc::new(schema_with_view_types(&arrow_schema))
+        } else {
+            arrow_schema
         };
 
         let mut options = ArrowReaderOptions::new().with_schema(Arc::clone(&arrow_schema));

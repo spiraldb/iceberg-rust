@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::builder::{BinaryViewBuilder, StringViewBuilder};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
@@ -572,8 +573,18 @@ pub(crate) fn create_primitive_array_single_element(
         (DataType::Utf8, Some(PrimitiveLiteral::String(v))) => {
             Ok(Arc::new(StringArray::from(vec![v.as_str()])))
         }
+        (DataType::Utf8View, Some(PrimitiveLiteral::String(v))) => {
+            let mut builder = StringViewBuilder::with_capacity(1);
+            builder.try_append_value_n(v, 1)?;
+            Ok(Arc::new(builder.finish()))
+        }
         (DataType::Binary, Some(PrimitiveLiteral::Binary(v))) => {
             Ok(Arc::new(BinaryArray::from_vec(vec![v.as_slice()])))
+        }
+        (DataType::BinaryView, Some(PrimitiveLiteral::Binary(v))) => {
+            let mut builder = BinaryViewBuilder::with_capacity(1);
+            builder.try_append_value_n(v, 1)?;
+            Ok(Arc::new(builder.finish()))
         }
         (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::Int128(v))) => {
             let array = Decimal128Array::from(vec![{ *v }])
@@ -668,9 +679,19 @@ pub(crate) fn create_primitive_array_repeated(
         (DataType::Utf8, Some(PrimitiveLiteral::String(value))) => Arc::new(
             StringArray::from_iter_values(std::iter::repeat_n(value.as_str(), num_rows)),
         ),
+        (DataType::Utf8View, Some(PrimitiveLiteral::String(value))) => {
+            let mut builder = StringViewBuilder::with_capacity(num_rows);
+            builder.try_append_value_n(value, num_rows)?;
+            Arc::new(builder.finish())
+        }
         (DataType::Binary, Some(PrimitiveLiteral::Binary(value))) => Arc::new(
             BinaryArray::from_iter_values(std::iter::repeat_n(value.as_slice(), num_rows)),
         ),
+        (DataType::BinaryView, Some(PrimitiveLiteral::Binary(value))) => {
+            let mut builder = BinaryViewBuilder::with_capacity(num_rows);
+            builder.try_append_value_n(value, num_rows)?;
+            Arc::new(builder.finish())
+        }
         (DataType::LargeBinary, Some(PrimitiveLiteral::Binary(value))) => Arc::new(
             LargeBinaryArray::from_iter_values(std::iter::repeat_n(value.as_slice(), num_rows)),
         ),
@@ -734,9 +755,9 @@ mod test {
 
     use arrow_array::builder::{Int32Builder, ListBuilder, MapBuilder, StructBuilder};
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-        Float64Array, Int32Array, Int64Array, StringArray, StructArray, Time64MicrosecondArray,
-        TimestampMicrosecondArray, TimestampNanosecondArray,
+        ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Decimal128Array,
+        Float32Array, Float64Array, Int32Array, Int64Array, StringArray, StringViewArray,
+        StructArray, Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
     };
     use arrow_schema::{DataType, Field, Fields, TimeUnit};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -1664,6 +1685,8 @@ mod test {
     #[test]
     fn test_create_null_arrays_preserve_type_and_length() {
         let data_types = [
+            DataType::Utf8View,
+            DataType::BinaryView,
             DataType::Decimal128(10, 2),
             DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             DataType::Struct(
@@ -1789,6 +1812,55 @@ mod test {
 
         assert_eq!(array.data_type(), &target_type);
         assert_eq!(array.len(), num_rows);
+    }
+
+    #[test]
+    fn test_create_view_constants_preserve_values_and_empty_batches() {
+        let text = "a partition value longer than twelve bytes";
+        let bytes = b"a binary value longer than twelve bytes";
+        for num_rows in [0, 1, 4] {
+            let text_literal = PrimitiveLiteral::String(text.to_owned());
+            let binary_literal = PrimitiveLiteral::Binary(bytes.to_vec());
+            let strings =
+                create_primitive_array_repeated(&DataType::Utf8View, Some(&text_literal), num_rows)
+                    .unwrap();
+            let binary = create_primitive_array_repeated(
+                &DataType::BinaryView,
+                Some(&binary_literal),
+                num_rows,
+            )
+            .unwrap();
+            assert_eq!(
+                strings
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![Some(text); num_rows],
+            );
+            assert_eq!(
+                binary
+                    .as_any()
+                    .downcast_ref::<BinaryViewArray>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![Some(bytes.as_slice()); num_rows],
+            );
+            if num_rows == 1 {
+                let single =
+                    create_primitive_array_single_element(&DataType::Utf8View, Some(&text_literal))
+                        .unwrap();
+                assert_eq!(single.as_ref(), strings.as_ref());
+                let single = create_primitive_array_single_element(
+                    &DataType::BinaryView,
+                    Some(&binary_literal),
+                )
+                .unwrap();
+                assert_eq!(single.as_ref(), binary.as_ref());
+            }
+        }
     }
 
     #[test]
