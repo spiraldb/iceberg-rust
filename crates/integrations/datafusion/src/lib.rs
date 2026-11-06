@@ -17,6 +17,7 @@
 
 //! Parallel Parquet scans of Iceberg snapshots in DataFusion.
 
+mod predicate;
 mod scan;
 
 use std::sync::Arc;
@@ -26,12 +27,14 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::stats::Precision;
 use datafusion::common::{DataFusionError, Result, Statistics};
-use datafusion::logical_expr::{Expr, TableType};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 
 /// Exposes an immutable Iceberg table snapshot as parallel Parquet scans.
+///
+/// Scans expose at least two partitions, using the session's target when larger.
 ///
 /// Scans expose at least two partitions, using the session's target when larger.
 #[derive(Debug)]
@@ -67,17 +70,24 @@ impl TableProvider for IcebergTableProvider {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = match projection {
             Some(indices) => Arc::new(self.schema.project(indices)?),
             None => self.schema.clone(),
         };
-        let builder = self
+        let mut builder = self
             .table
             .scan()
             .select(schema.fields().iter().map(|f| f.name()));
+        if let Some(predicate) = filters
+            .iter()
+            .filter_map(|expr| predicate::predicate(expr, self.table.metadata().current_schema()))
+            .reduce(|a, b| a.and(b))
+        {
+            builder = builder.with_filter(predicate);
+        }
         let scan = builder.build().map_err(external)?;
         let tasks = futures::TryStreamExt::try_collect::<Vec<_>>(
             scan.plan_files().await.map_err(external)?,
@@ -90,8 +100,24 @@ impl TableProvider for IcebergTableProvider {
             tasks,
             state.config().target_partitions(),
             state.config().batch_size(),
-            !_filters.is_empty(),
+            !filters.is_empty(),
         )?))
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|expr| {
+                if predicate::predicate(expr, self.table.metadata().current_schema()).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 
     fn statistics(&self) -> Option<Statistics> {
