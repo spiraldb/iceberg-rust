@@ -71,6 +71,7 @@ pub struct iceberg::arrow::ArrowReaderBuilder
 impl iceberg::arrow::ArrowReaderBuilder
 pub fn iceberg::arrow::ArrowReaderBuilder::build(self) -> iceberg::arrow::ArrowReader
 pub fn iceberg::arrow::ArrowReaderBuilder::new(file_io: iceberg::io::FileIO, runtime: iceberg::Runtime) -> Self
+pub fn iceberg::arrow::ArrowReaderBuilder::with_background_reads(self, background_reads: bool) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_batch_size(self, batch_size: usize) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_bloom_filter_enabled(self, bloom_filter_enabled: bool) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_data_file_concurrency_limit(self, val: usize) -> Self
@@ -96,6 +97,7 @@ pub fn iceberg::arrow::RecordBatchPartitionSplitter::try_new_with_precomputed_va
 pub struct iceberg::arrow::ScanMetrics
 impl iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::bytes_read(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::elapsed_compute_nanos(&self) -> u64
 impl core::clone::Clone for iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::clone(&self) -> iceberg::scan::ScanMetrics
 impl core::fmt::Debug for iceberg::scan::ScanMetrics
@@ -1425,6 +1427,7 @@ pub fn iceberg::scan::FileScanTaskDeleteFile::deserialize<__D>(__deserializer: _
 pub struct iceberg::scan::ScanMetrics
 impl iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::bytes_read(&self) -> u64
+pub fn iceberg::scan::ScanMetrics::elapsed_compute_nanos(&self) -> u64
 impl core::clone::Clone for iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::clone(&self) -> iceberg::scan::ScanMetrics
 impl core::fmt::Debug for iceberg::scan::ScanMetrics

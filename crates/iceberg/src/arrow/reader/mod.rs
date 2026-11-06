@@ -34,6 +34,7 @@ const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 10;
 /// Matches DataFusion's default `ParquetOptions::metadata_size_hint`.
 const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
 
+mod background;
 mod file_reader;
 mod options;
 mod pipeline;
@@ -62,6 +63,7 @@ pub struct ArrowReaderBuilder {
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
+    background_reads: bool,
 }
 
 impl ArrowReaderBuilder {
@@ -78,6 +80,7 @@ impl ArrowReaderBuilder {
             bloom_filter_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
+            background_reads: false,
         }
     }
 
@@ -91,6 +94,12 @@ impl ArrowReaderBuilder {
     /// to something other than the default
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Drives reads on the configured CPU runtime with bounded batch prefetching.
+    pub fn with_background_reads(mut self, background_reads: bool) -> Self {
+        self.background_reads = background_reads;
         self
     }
 
@@ -162,6 +171,7 @@ impl ArrowReaderBuilder {
             row_selection_enabled: self.row_selection_enabled,
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
+            background_runtime: self.background_reads.then_some(self.runtime),
         }
     }
 }
@@ -180,4 +190,5 @@ pub struct ArrowReader {
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    background_runtime: Option<Runtime>,
 }

@@ -104,6 +104,12 @@ impl ArrowReader {
             )
         };
 
+        let stream = match self.background_runtime {
+            Some(runtime) => {
+                super::background::read_in_background(stream, &runtime, scan_metrics.clone())
+            }
+            None => stream,
+        };
         Ok(ScanResult::new(stream, scan_metrics))
     }
 }

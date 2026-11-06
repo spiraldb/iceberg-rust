@@ -20,6 +20,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 
@@ -53,12 +54,14 @@ impl<F: FileRead> FileRead for CountingFileRead<F> {
 #[derive(Clone, Debug)]
 pub struct ScanMetrics {
     bytes_read: Arc<AtomicU64>,
+    elapsed_compute_nanos: Arc<AtomicU64>,
 }
 
 impl ScanMetrics {
     pub(crate) fn new() -> Self {
         Self {
             bytes_read: Arc::new(AtomicU64::new(0)),
+            elapsed_compute_nanos: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -69,6 +72,17 @@ impl ScanMetrics {
     /// Total bytes read from storage during this scan, including data files and delete files.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_elapsed_compute(&self, elapsed: Duration) {
+        let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.elapsed_compute_nanos
+            .fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// Total background reader poll time in nanoseconds, excluding asynchronous waits.
+    pub fn elapsed_compute_nanos(&self) -> u64 {
+        self.elapsed_compute_nanos.load(Ordering::Relaxed)
     }
 }
 

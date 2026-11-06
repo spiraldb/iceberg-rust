@@ -70,6 +70,10 @@ impl RuntimeHandle {
         Self { handle }
     }
 
+    pub(crate) fn enter(&self) -> tokio::runtime::EnterGuard<'_> {
+        self.handle.enter()
+    }
+
     /// Spawn an async task.
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
