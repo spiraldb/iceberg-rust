@@ -39,8 +39,10 @@ values, initial defaults, and floating comparisons remain residual to preserve
 DataFusion semantics. Limits are enforced by DataFusion.
 
 DataFusion's live join and top-k filters can prune rows during Parquet decoding.
-Fields are matched by Iceberg ID, with lossless type promotions. Files whose
-filter fields cannot be adapted keep the complete DataFusion residual filter.
+The reader uses comparisons, null checks, and short literal lists, observing
+filter updates between batches. Fields are matched by Iceberg ID. Expensive
+expressions and fields that cannot be adapted keep the complete DataFusion
+residual filter.
 
 The default dependency graph excludes Vortex. The provider rejects data-file
 formats other than Parquet even if another application enables optional formats
