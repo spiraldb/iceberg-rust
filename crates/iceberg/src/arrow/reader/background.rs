@@ -27,9 +27,19 @@ use tokio::sync::mpsc;
 
 use super::ComputeTimeObserver;
 use crate::arrow::ScanMetrics;
-use crate::runtime::{JoinHandle, Runtime};
+use crate::runtime::{JoinHandle, Runtime, RuntimeHandle};
 use crate::scan::ArrowRecordBatchStream;
 use crate::{Error, ErrorKind, Result};
+
+pub(super) fn read_in_foreground(
+    mut input: ArrowRecordBatchStream,
+    io_runtime: RuntimeHandle,
+) -> ArrowRecordBatchStream {
+    Box::pin(futures::stream::poll_fn(move |cx| {
+        let _entered = io_runtime.enter();
+        input.poll_next_unpin(cx)
+    }))
+}
 
 pub(super) fn read_in_background(
     mut input: ArrowRecordBatchStream,
@@ -129,7 +139,7 @@ mod tests {
     use tokio::runtime::Builder;
     use tokio::sync::oneshot;
 
-    use super::read_in_background;
+    use super::{read_in_background, read_in_foreground};
     use crate::Runtime;
     use crate::arrow::ScanMetrics;
     use crate::scan::ArrowRecordBatchStream;
@@ -228,6 +238,27 @@ mod tests {
             elapsed.as_nanos(),
             u128::from(metrics.elapsed_compute_nanos())
         );
+    }
+
+    #[test]
+    fn foreground_reads_use_io_driver_on_compute_only_caller() {
+        let io = Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let cpu = Builder::new_current_thread().build().unwrap();
+        let runtime = Runtime::new_with_split(&io, &cpu);
+        let caller = std::thread::current().id();
+        let input = stream::once(async move {
+            assert_eq!(std::thread::current().id(), caller);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert_eq!(std::thread::current().id(), caller);
+            Ok(batch())
+        });
+        let output = read_in_foreground(Box::pin(input), runtime.io().clone());
+        let batches: Vec<_> = cpu.block_on(output.try_collect()).unwrap();
+        assert_eq!(batches, vec![batch()]);
     }
 
     #[test]
