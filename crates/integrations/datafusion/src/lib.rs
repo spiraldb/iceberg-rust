@@ -19,6 +19,7 @@
 
 mod predicate;
 mod scan;
+mod statistics;
 
 use std::sync::Arc;
 
@@ -126,10 +127,7 @@ impl TableProvider for IcebergTableProvider {
             .get("total-records")
             .and_then(|value| value.parse().ok())
             .map_or(Precision::Absent, Precision::Inexact);
-        statistics.total_byte_size = summary
-            .get("total-files-size")
-            .and_then(|value| value.parse().ok())
-            .map_or(Precision::Absent, Precision::Inexact);
+        statistics::output_bytes(&mut statistics, &self.schema);
         Some(statistics)
     }
 }

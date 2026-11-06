@@ -42,7 +42,7 @@ use futures::{StreamExt, TryStreamExt};
 use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 
-use crate::external;
+use crate::{external, statistics::output_bytes};
 
 mod dynamic_filter;
 
@@ -92,8 +92,7 @@ impl IcebergScan {
         {
             statistics.num_rows = statistics.num_rows.to_inexact();
         }
-        statistics.total_byte_size =
-            usize::try_from(total_bytes).map_or(Precision::Absent, Precision::Inexact);
+        output_bytes(&mut statistics, &schema);
         let target_bytes = total_bytes.div_ceil(partitions as u64).max(1);
         let mut groups = vec![Vec::new(); partitions];
         let mut partition = 0;
@@ -292,15 +291,12 @@ impl ExecutionPlan for IcebergScan {
                 let tasks = self.partitions.get(partition).ok_or_else(|| {
                     DataFusionError::Plan(format!("Invalid Iceberg partition {partition}"))
                 })?;
-                let mut statistics = Statistics::new_unknown(&self.schema());
-                let total_bytes = tasks.iter().try_fold(0usize, |sum, task| {
-                    sum.checked_add(usize::try_from(task.length()).ok()?)
-                });
-                statistics.total_byte_size =
-                    total_bytes.map_or(Precision::Absent, Precision::Inexact);
+                let schema = self.schema();
+                let mut statistics = Statistics::new_unknown(&schema);
                 if tasks.is_empty() {
                     statistics.num_rows = Precision::Exact(0);
                 }
+                output_bytes(&mut statistics, &schema);
                 Ok(Arc::new(statistics))
             }
         }
