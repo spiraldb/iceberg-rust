@@ -558,7 +558,7 @@ impl FileScanTaskReader {
             // rewrite it here. Matches TableScan::with_filter.
             let predicate = predicate.rewrite_not();
 
-            let (_, field_id_map) = ArrowReader::build_field_id_set_and_map(
+            let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
                 record_batch_stream_builder.schema(),
                 &predicate,
@@ -567,7 +567,8 @@ impl FileScanTaskReader {
 
             let row_filter = ArrowReader::get_row_filter(
                 &predicate,
-                record_batch_stream_builder.metadata(),
+                record_batch_stream_builder.parquet_schema(),
+                &iceberg_field_ids,
                 &field_id_map,
             )?;
             record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);

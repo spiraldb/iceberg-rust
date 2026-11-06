@@ -24,10 +24,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowPredicate, ArrowPredicateFn, RowFilter, RowSelection};
+use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter, RowSelection};
 use parquet::file::metadata::ParquetMetaData;
+use parquet::schema::types::SchemaDescriptor;
 
-use super::{ArrowReader, CollectFieldIdVisitor, PredicateConverter};
+use super::{ArrowReader, PredicateConverter};
 use crate::error::Result;
 use crate::expr::BoundPredicate;
 use crate::expr::visitors::bound_predicate_visitor::visit;
@@ -36,69 +37,34 @@ use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator
 use crate::spec::Schema;
 use crate::{Error, ErrorKind};
 
-fn collect_conjuncts<'a>(predicate: &'a BoundPredicate, conjuncts: &mut Vec<&'a BoundPredicate>) {
-    if let BoundPredicate::And(expression) = predicate {
-        for input in expression.inputs() {
-            collect_conjuncts(input, conjuncts);
-        }
-    } else {
-        conjuncts.push(predicate);
-    }
-}
-
 impl ArrowReader {
     pub(super) fn get_row_filter(
-        predicate: &BoundPredicate,
-        parquet_metadata: &Arc<ParquetMetaData>,
+        predicates: &BoundPredicate,
+        parquet_schema: &SchemaDescriptor,
+        iceberg_field_ids: &HashSet<i32>,
         field_id_map: &HashMap<i32, usize>,
     ) -> Result<RowFilter> {
-        let parquet_schema = parquet_metadata.file_metadata().schema_descr();
-        let mut conjuncts = Vec::new();
-        collect_conjuncts(predicate, &mut conjuncts);
-        let mut stages = Vec::with_capacity(conjuncts.len());
-        for conjunct in conjuncts {
-            let mut collector = CollectFieldIdVisitor {
-                field_ids: HashSet::new(),
-            };
-            visit(&mut collector, conjunct)?;
-            let mut column_indices = collector
-                .field_ids()
-                .iter()
-                .filter_map(|field_id| field_id_map.get(field_id).copied())
-                .collect::<Vec<_>>();
-            column_indices.sort_unstable();
-            column_indices.dedup();
-            let mut compressed_bytes = 0u64;
-            for row_group in parquet_metadata.row_groups() {
-                for &index in &column_indices {
-                    let column = row_group.columns().get(index).ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            "Predicate column missing from Parquet row group",
-                        )
-                    })?;
-                    let bytes = u64::try_from(column.compressed_size()).map_err(|_| {
-                        Error::new(ErrorKind::DataInvalid, "Negative Parquet column length")
-                    })?;
-                    compressed_bytes = compressed_bytes.saturating_add(bytes);
-                }
-            }
-            stages.push((compressed_bytes, conjunct, column_indices));
-        }
-        stages.sort_by_key(|(compressed_bytes, _, _)| *compressed_bytes);
+        // Collect Parquet column indices from field ids.
+        // If the field id is not found in Parquet schema, it will be ignored due to schema evolution.
+        let mut column_indices = iceberg_field_ids
+            .iter()
+            .filter_map(|field_id| field_id_map.get(field_id).cloned())
+            .collect::<Vec<_>>();
+        column_indices.sort();
 
-        let mut filters: Vec<Box<dyn ArrowPredicate>> = Vec::with_capacity(stages.len());
-        for (_, conjunct, column_indices) in stages {
-            let mut converter = PredicateConverter {
-                parquet_schema,
-                column_map: field_id_map,
-                column_indices: &column_indices,
-            };
-            let predicate_func = visit(&mut converter, conjunct)?;
-            let projection = ProjectionMask::leaves(parquet_schema, column_indices);
-            filters.push(Box::new(ArrowPredicateFn::new(projection, predicate_func)));
-        }
-        Ok(RowFilter::new(filters))
+        // The converter that converts `BoundPredicates` to `ArrowPredicates`
+        let mut converter = PredicateConverter {
+            parquet_schema,
+            column_map: field_id_map,
+            column_indices: &column_indices,
+        };
+
+        // After collecting required leaf column indices used in the predicate,
+        // creates the projection mask for the Arrow predicates.
+        let projection_mask = ProjectionMask::leaves(parquet_schema, column_indices.clone());
+        let predicate_func = visit(&mut converter, predicates)?;
+        let arrow_predicate = ArrowPredicateFn::new(projection_mask, predicate_func);
+        Ok(RowFilter::new(vec![Box::new(arrow_predicate)]))
     }
 
     pub(super) fn get_selected_row_group_indices(
@@ -296,7 +262,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::Runtime;
-    use crate::arrow::{ArrowReader, ArrowReaderBuilder, schema_to_arrow_schema};
+    use crate::arrow::{ArrowReader, ArrowReaderBuilder};
     use crate::expr::{Bind, BoundPredicate, Predicate, Reference};
     use crate::io::FileIO;
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
@@ -439,132 +405,6 @@ mod tests {
         let result_data = test_perform_read(predicate, schema, table_location, reader).await;
 
         assert_eq!(result_data, expected);
-    }
-
-    #[tokio::test]
-    async fn test_conjunctive_filters_preserve_or_nulls_and_missing_columns() {
-        let schema = Arc::new(
-            Schema::builder()
-                .with_fields(vec![
-                    NestedField::required(1, "id", PrimitiveType::Int.into()).into(),
-                    NestedField::optional(2, "quantity", PrimitiveType::Int.into()).into(),
-                    NestedField::optional(3, "label", PrimitiveType::String.into()).into(),
-                    NestedField::optional(4, "missing", PrimitiveType::Int.into()).into(),
-                ])
-                .build()
-                .unwrap(),
-        );
-        let arrow_schema = Arc::new(
-            schema_to_arrow_schema(&schema)
-                .unwrap()
-                .project(&[2, 0, 1])
-                .unwrap(),
-        );
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(StringArray::from(vec![
-                Some("keep"),
-                None,
-                Some("drop"),
-                Some("keep"),
-                Some("keep"),
-                None,
-                Some("drop"),
-                Some("keep"),
-                Some("keep"),
-                Some("keep"),
-                None,
-                Some("drop"),
-            ])) as ArrayRef,
-            Arc::new(Int32Array::from_iter_values(0..12)),
-            Arc::new(Int32Array::from(vec![
-                Some(0),
-                Some(1),
-                Some(2),
-                None,
-                Some(4),
-                Some(5),
-                Some(6),
-                None,
-                Some(8),
-                Some(9),
-                Some(10),
-                Some(11),
-            ])),
-        ])
-        .unwrap();
-        let root = TempDir::new().unwrap();
-        let path = root.path().join("conjunction.parquet");
-        let mut writer = ArrowWriter::try_new(
-            File::create(&path).unwrap(),
-            arrow_schema,
-            Some(
-                WriterProperties::builder()
-                    .set_max_row_group_row_count(Some(3))
-                    .build(),
-            ),
-        )
-        .unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        let predicate = Reference::new("label")
-            .equal_to(Datum::string("keep"))
-            .or(Reference::new("id")
-                .equal_to(Datum::int(5))
-                .and(Reference::new("quantity").greater_than_or_equal_to(Datum::int(4))))
-            .and(Reference::new("missing").is_null())
-            .and(Reference::new("quantity").greater_than_or_equal_to(Datum::int(2)))
-            .and(Reference::new("id").less_than(Datum::int(10)))
-            .bind(schema.clone(), true)
-            .unwrap();
-        let task = FileScanTask::builder()
-            .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
-            .with_start(0)
-            .with_length(0)
-            .with_data_file_path(path.to_string_lossy().into_owned())
-            .with_data_file_format(DataFileFormat::Parquet)
-            .with_schema(schema)
-            .with_project_field_ids(vec![1, 3, 4])
-            .with_predicate(Some(predicate))
-            .with_case_sensitive(true)
-            .build()
-            .unwrap();
-        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
-            .with_batch_size(2)
-            .with_row_group_filtering_enabled(false)
-            .build();
-        let batches = reader
-            .read(Box::pin(futures::stream::iter([Ok(task)])))
-            .unwrap()
-            .stream()
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .unwrap();
-        let mut rows = Vec::new();
-        for batch in batches {
-            let ids = batch
-                .column_by_name("id")
-                .unwrap()
-                .as_primitive::<arrow_array::types::Int32Type>();
-            let labels = batch.column_by_name("label").unwrap().as_string::<i32>();
-            let missing = batch
-                .column_by_name("missing")
-                .unwrap()
-                .as_primitive::<arrow_array::types::Int32Type>();
-            assert!(missing.iter().all(|value| value.is_none()));
-            rows.extend(
-                ids.values()
-                    .iter()
-                    .zip(labels.iter())
-                    .map(|(&id, label)| (id, label.map(str::to_owned))),
-            );
-        }
-        assert_eq!(rows, vec![
-            (4, Some("keep".to_owned())),
-            (5, None),
-            (8, Some("keep".to_owned())),
-            (9, Some("keep".to_owned())),
-        ]);
     }
 
     #[tokio::test]
