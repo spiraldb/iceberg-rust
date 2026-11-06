@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, StructArray,
+    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, StructArray,
 };
 use datafusion::arrow::buffer::NullBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -60,6 +60,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(write: bool) -> Self {
+        Self::new_with_id_type(write, DataType::Int64).await
+    }
+
+    async fn new_with_id_type(write: bool, id_type: DataType) -> Self {
         let root = tempfile::tempdir().unwrap();
         let catalog = MemoryCatalogBuilder::default()
             .with_storage_factory(Arc::new(LocalFsStorageFactory))
@@ -79,7 +83,7 @@ impl Fixture {
             .await
             .unwrap();
         let schema = arrow_schema_to_schema_auto_assign_ids(&Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
+            Field::new("id", id_type.clone(), id_type == DataType::Int32),
             Field::new("label", DataType::Utf8, true),
             Field::new("flag", DataType::Boolean, true),
             Field::new(
@@ -105,8 +109,15 @@ impl Fixture {
         let DataType::Struct(payload_fields) = arrow_schema.field(3).data_type() else {
             unreachable!()
         };
+        let ids: ArrayRef = match id_type {
+            DataType::Int32 => Arc::new(Int32Array::from_iter(
+                (0..ROWS).map(|id| (id % 13 != 0).then_some(id as i32)),
+            )),
+            DataType::Int64 => Arc::new(Int64Array::from_iter_values(0..ROWS)),
+            _ => unreachable!(),
+        };
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int64Array::from_iter_values(0..ROWS)) as ArrayRef,
+            ids,
             Arc::new(StringArray::from_iter(
                 (0..ROWS).map(|id| (id % 11 != 0).then(|| format!("row-{id}"))),
             )),
@@ -567,4 +578,94 @@ async fn added_columns_and_empty_snapshots_keep_their_schema() {
     assert_eq!(plan.schema(), empty.batch.schema());
     assert_eq!(plan.output_partitioning().partition_count(), 4);
     assert!(collect(plan, context.task_ctx()).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn promoted_integer_predicates_preserve_out_of_range_literals() {
+    let fixture = Fixture::new_with_id_type(true, DataType::Int32).await;
+    let current = fixture.table.metadata().current_schema();
+    let mut fields = current.as_struct().fields().to_vec();
+    let mut id = fields[0].as_ref().clone();
+    id.field_type = Box::new(Type::Primitive(PrimitiveType::Long));
+    fields[0] = Arc::new(id);
+    let schema_id = current.schema_id() + 1;
+    let schema = iceberg::spec::Schema::builder()
+        .with_schema_id(schema_id)
+        .with_fields(fields)
+        .build()
+        .unwrap();
+    let metadata = fixture
+        .table
+        .metadata()
+        .clone()
+        .into_builder(fixture.table.metadata_location().map(str::to_owned))
+        .add_schema(schema)
+        .unwrap()
+        .set_current_schema(schema_id)
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+    let table = Table::builder()
+        .metadata(metadata)
+        .identifier(fixture.table.identifier().clone())
+        .file_io(fixture.table.file_io().clone())
+        .runtime(Runtime::current())
+        .build()
+        .unwrap();
+    let provider = Arc::new(IcebergTableProvider::try_new(table).unwrap());
+    let context = fixture.context();
+    context
+        .register_table("promoted", provider.clone())
+        .unwrap();
+    let unfiltered = context
+        .sql("SELECT * FROM promoted")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        unfiltered.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        ROWS as usize
+    );
+    assert_eq!(
+        unfiltered
+            .iter()
+            .map(|batch| batch.column(0).null_count())
+            .sum::<usize>(),
+        20
+    );
+    assert_eq!(provider.schema().field(0).data_type(), &DataType::Int64);
+    context
+        .register_table(
+            "reference",
+            Arc::new(MemTable::try_new(provider.schema(), vec![unfiltered]).unwrap()),
+        )
+        .unwrap();
+    for filter in [
+        "id < 2147483648",
+        "id >= -2147483649",
+        "id != 2147483648",
+        "id IN (4, 97, 2147483648)",
+        "id NOT IN (4, 97, 2147483648)",
+        "id IN (-2147483649, 4, 97)",
+        "id NOT IN (-2147483649, 4, 97)",
+        "id IS NULL OR id < 2147483648",
+    ] {
+        let mut results = Vec::new();
+        for name in ["promoted", "reference"] {
+            let batches = context
+                .sql(&format!(
+                    "SELECT id, label FROM {name} WHERE {filter} ORDER BY id NULLS FIRST, label"
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            results.push(pretty_format_batches(&batches).unwrap().to_string());
+        }
+        assert_eq!(results[0], results[1], "filter: {filter}");
+    }
 }
