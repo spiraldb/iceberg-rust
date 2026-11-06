@@ -42,6 +42,7 @@ mod predicate_visitor;
 mod projection;
 mod row_filter;
 mod row_lineage;
+#[cfg(feature = "vortex")]
 pub(crate) mod vortex;
 pub use file_reader::ArrowFileReader;
 pub(crate) use options::ParquetReadOptions;

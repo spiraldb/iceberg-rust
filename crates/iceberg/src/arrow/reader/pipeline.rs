@@ -150,6 +150,7 @@ impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
         match task.data_file_format() {
             DataFileFormat::Parquet => self.process_parquet(task).await,
+            #[cfg(feature = "vortex")]
             DataFileFormat::Vortex => {
                 super::vortex::read_vortex_task(
                     task,
@@ -907,6 +908,37 @@ mod tests {
     // Noon on 3333-01-01 (Julian day 2_953_529) — outside the i64 nanosecond range (~1677-2262).
     const INT96_TEST_NANOS_WITHIN_DAY: u64 = 43_200_000_000_000;
     const INT96_TEST_JULIAN_DAY: u32 = 2_953_529;
+
+    #[cfg(not(feature = "vortex"))]
+    #[tokio::test]
+    async fn test_vortex_data_file_requires_feature() {
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(0)
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path("unopened.vortex".to_string())
+            .with_data_file_format(DataFileFormat::Vortex)
+            .with_schema(Arc::new(Schema::builder().build().unwrap()))
+            .with_project_field_ids(vec![])
+            .with_case_sensitive(true)
+            .build()
+            .unwrap();
+        let tasks = Box::pin(futures::stream::iter([Ok(task)])) as FileScanTaskStream;
+        let result = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+            .build()
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<_>>()
+            .await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported data file format: vortex")
+        );
+    }
 
     fn make_int96_test_value() -> (parquet::data_type::Int96, i64) {
         let mut val = parquet::data_type::Int96::new();
