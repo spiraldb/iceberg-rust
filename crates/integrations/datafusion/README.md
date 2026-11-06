@@ -24,8 +24,10 @@ table's schema and snapshot; construct a new provider to observe catalog updates
 
 Scans expose the session's target partition count, with a minimum of two. File
 byte ranges are balanced across consumers and own disjoint Parquet row groups.
-Each consumer polls its own reader stream. Small files with one row group can
-leave some partitions empty.
+Each consumer has its own reader stream. Decoding runs on the table's CPU
+executor, with bounded buffering per partition and cancellation when a consumer
+stops. The table's I/O executor supplies asynchronous I/O and timer drivers.
+Small files with one row group can leave some partitions empty.
 
 Projection, schema evolution, and Iceberg positional and equality deletes use
 the Iceberg reader. Supported primitive predicates prune manifests and Parquet

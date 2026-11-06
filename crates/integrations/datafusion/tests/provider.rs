@@ -326,53 +326,80 @@ impl Fixture {
     }
 }
 
-#[tokio::test]
-async fn parallel_single_file_scans_preserve_projection_and_row_counts() {
-    let fixture = Fixture::new(true).await;
-    let provider = IcebergTableProvider::try_new(fixture.table.clone()).unwrap();
-    let context = fixture.context();
-    let state = context.state();
-    let projection = vec![3, 1, 0];
-    let plan = provider
-        .scan(&state, Some(&projection), &[], None)
-        .await
+#[test]
+fn parallel_single_file_scans_preserve_projection_and_row_counts() {
+    let query_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
         .unwrap();
-    assert_eq!(plan.output_partitioning().partition_count(), 4);
-    let partitions = collect_partitioned(plan, context.task_ctx()).await.unwrap();
-    assert!(
-        partitions
-            .iter()
-            .filter(|batches| !batches.is_empty())
-            .count()
-            > 1
-    );
-    let mut ids = Vec::new();
-    for batch in partitions.into_iter().flatten() {
-        assert_eq!(batch.schema().field(0).name(), "payload");
-        assert_eq!(batch.schema().field(1).name(), "label");
-        let column = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int64Array>()
+    let cpu_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .build()
+        .unwrap();
+    let runtime = Runtime::new_with_split(&query_runtime, &cpu_runtime);
+    let (_fixture, plan, context) = query_runtime.block_on(async {
+        let fixture = Fixture::new(true).await;
+        let provider =
+            IcebergTableProvider::try_new(fixture.table.clone().with_runtime(runtime)).unwrap();
+        let context = fixture.context();
+        let state = context.state();
+        let projection = vec![3, 1, 0];
+        let plan = provider
+            .scan(&state, Some(&projection), &[], None)
+            .await
             .unwrap();
-        ids.extend(column.values().iter().copied());
-    }
-    ids.sort_unstable();
-    assert_eq!(ids, (0..ROWS).collect::<Vec<_>>());
+        assert_eq!(plan.output_partitioning().partition_count(), 4);
+        let partitions = collect_partitioned(plan, context.task_ctx()).await.unwrap();
+        assert!(
+            partitions
+                .iter()
+                .filter(|batches| !batches.is_empty())
+                .count()
+                > 1
+        );
+        let mut ids = Vec::new();
+        for batch in partitions.into_iter().flatten() {
+            assert_eq!(batch.schema().field(0).name(), "payload");
+            assert_eq!(batch.schema().field(1).name(), "label");
+            let column = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            ids.extend(column.values().iter().copied());
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (0..ROWS).collect::<Vec<_>>());
 
-    let empty = vec![];
-    let plan = provider
-        .scan(&state, Some(&empty), &[], None)
-        .await
-        .unwrap();
-    let batches = collect(plan, context.task_ctx()).await.unwrap();
-    assert_eq!(
-        (
-            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-            batches.iter().all(|b| b.num_columns() == 0)
-        ),
-        (ROWS as usize, true)
-    );
+        let empty = vec![];
+        let plan = provider
+            .scan(&state, Some(&empty), &[], None)
+            .await
+            .unwrap();
+        let batches = collect(plan, context.task_ctx()).await.unwrap();
+        assert_eq!(
+            (
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                batches.iter().all(|b| b.num_columns() == 0)
+            ),
+            (ROWS as usize, true)
+        );
+        let plan = provider.scan(&state, None, &[], None).await.unwrap();
+        (fixture, plan, context.task_ctx())
+    });
+    cpu_runtime.shutdown_background();
+    let error = query_runtime.block_on(collect(plan, context)).unwrap_err();
+    let mut cause: &(dyn std::error::Error + 'static) = &error;
+    loop {
+        if let Some(join) = cause.downcast_ref::<tokio::task::JoinError>() {
+            assert!(join.is_cancelled());
+            break;
+        }
+        cause = cause
+            .source()
+            .expect("CPU executor cancellation must reach the consumer");
+    }
 }
 
 #[tokio::test]

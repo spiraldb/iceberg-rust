@@ -17,6 +17,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::stats::Precision;
@@ -180,12 +181,14 @@ impl ExecutionPlan for IcebergScan {
             .reader_builder()
             .with_batch_size(self.batch_size)
             .with_data_file_concurrency_limit(1)
+            .with_background_reads(true)
             .build()
             .read(futures::stream::iter(tasks.into_iter().map(Ok)).boxed())
             .map_err(external)?;
         let io_metrics = native.metrics().clone();
         let bytes = MetricBuilder::new(&self.metrics).counter("bytes_scanned", partition);
         let mut bytes_recorded = 0;
+        let mut compute_recorded = 0;
         let mut input = native.stream().map_err(external);
         let stream = futures::stream::poll_fn(move |cx| {
             let timer = baseline.elapsed_compute().timer();
@@ -194,6 +197,11 @@ impl ExecutionPlan for IcebergScan {
             let bytes_read = io_metrics.bytes_read();
             bytes.add((bytes_read - bytes_recorded) as usize);
             bytes_recorded = bytes_read;
+            let compute = io_metrics.elapsed_compute_nanos();
+            baseline
+                .elapsed_compute()
+                .add_duration(Duration::from_nanos(compute - compute_recorded));
+            compute_recorded = compute;
             baseline.record_poll(poll)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
