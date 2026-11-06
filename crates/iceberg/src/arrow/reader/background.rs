@@ -25,6 +25,7 @@ use futures::future::{AbortHandle, Abortable, Aborted, poll_fn};
 use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 
+use super::ComputeTimeObserver;
 use crate::arrow::ScanMetrics;
 use crate::runtime::{JoinHandle, Runtime};
 use crate::scan::ArrowRecordBatchStream;
@@ -34,6 +35,7 @@ pub(super) fn read_in_background(
     mut input: ArrowRecordBatchStream,
     runtime: &Runtime,
     metrics: ScanMetrics,
+    observer: Option<ComputeTimeObserver>,
 ) -> ArrowRecordBatchStream {
     let (sender, receiver) = mpsc::channel(2);
     let (abort, registration) = AbortHandle::new_pair();
@@ -47,7 +49,11 @@ pub(super) fn read_in_background(
                     let _entered = io_runtime.enter();
                     input.poll_next_unpin(cx)
                 };
-                metrics.record_elapsed_compute(start.elapsed());
+                let elapsed = start.elapsed();
+                metrics.record_elapsed_compute(elapsed);
+                if let Some(observer) = &observer {
+                    observer(elapsed);
+                }
                 poll
             })
             .await;
@@ -111,8 +117,8 @@ impl Drop for BackgroundRead {
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
     use std::task::Poll;
     use std::time::Duration;
 
@@ -157,9 +163,19 @@ mod tests {
             Poll::Ready(Some(Ok(batch())))
         });
         let metrics = ScanMetrics::new();
-        let output = read_in_background(Box::pin(input), &Runtime::current(), metrics.clone());
+        let observed = Arc::new(AtomicUsize::new(0));
+        let observed_polls = observed.clone();
+        let output = read_in_background(
+            Box::pin(input),
+            &Runtime::current(),
+            metrics.clone(),
+            Some(Arc::new(move |_| {
+                observed_polls.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
         prefetch_done.await.unwrap();
         assert_eq!(produced.load(Ordering::Relaxed), 3);
+        assert_eq!(observed.load(Ordering::Relaxed), 3);
         assert!(metrics.elapsed_compute_nanos() > 0);
         drop(output);
         tokio::time::timeout(Duration::from_secs(1), drop_done)
@@ -173,10 +189,44 @@ mod tests {
         let input: ArrowRecordBatchStream = Box::pin(stream::poll_fn(|_| {
             panic!("background read panic");
         }));
-        let mut output = read_in_background(input, &Runtime::current(), ScanMetrics::new());
+        let mut output = read_in_background(input, &Runtime::current(), ScanMetrics::new(), None);
         let error = output.next().await.unwrap().unwrap_err();
         assert!(error.to_string().contains("background read panic"));
         assert!(output.next().await.is_none());
+    }
+
+    #[test]
+    fn background_compute_observer_reports_in_flight_poll_after_consumer_drop() {
+        let io = Builder::new_current_thread().enable_all().build().unwrap();
+        let cpu = Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let (started, start_done) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (observed, observation) = mpsc::channel();
+        let input = stream::poll_fn(move |_| {
+            started.send(()).unwrap();
+            released.recv().unwrap();
+            Poll::Ready(Some(Ok(batch())))
+        });
+        let metrics = ScanMetrics::new();
+        let output = read_in_background(
+            Box::pin(input),
+            &Runtime::new_with_split(&io, &cpu),
+            metrics.clone(),
+            Some(Arc::new(move |elapsed| {
+                let _ = observed.send(elapsed);
+            })),
+        );
+        start_done.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(output);
+        release.send(()).unwrap();
+        let elapsed = observation.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            elapsed.as_nanos(),
+            u128::from(metrics.elapsed_compute_nanos())
+        );
     }
 
     #[test]
@@ -197,6 +247,7 @@ mod tests {
             Box::pin(input),
             &Runtime::new_with_split(&io, &cpu),
             metrics.clone(),
+            None,
         );
         let batches: Vec<_> = io.block_on(output.try_collect()).unwrap();
         assert_eq!(batches, vec![batch()]);
@@ -207,6 +258,7 @@ mod tests {
             input,
             &Runtime::new_with_split(&io, &cpu),
             ScanMetrics::new(),
+            None,
         );
         drop(cpu);
         let error = io
