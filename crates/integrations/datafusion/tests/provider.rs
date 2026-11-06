@@ -46,7 +46,7 @@ use iceberg::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterB
 use iceberg::{Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Runtime, TableCreation};
 use iceberg_datafusion::IcebergTableProvider;
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
 const ROWS: i64 = 257;
@@ -400,6 +400,103 @@ fn parallel_single_file_scans_preserve_projection_and_row_counts() {
             .source()
             .expect("CPU executor cancellation must reach the consumer");
     }
+}
+
+#[tokio::test]
+async fn multiple_files_distribute_rows_across_independent_consumers() {
+    const ROWS_PER_FILE: i64 = ROWS * 4;
+    const ROW_GROUP_ROWS: usize = 128;
+    let fixture = Fixture::new(false).await;
+    let mut files = Vec::new();
+    let padding = "x".repeat(2048);
+    let base = datafusion::arrow::compute::concat_batches(
+        &fixture.batch.schema(),
+        std::iter::repeat_n(&fixture.batch, 4),
+    )
+    .unwrap();
+    for file in 0..8 {
+        let first = file * ROWS_PER_FILE;
+        let mut columns = base.columns().to_vec();
+        columns[0] = Arc::new(Int64Array::from_iter_values(first..first + ROWS_PER_FILE));
+        columns[1] = Arc::new(StringArray::from_iter_values(
+            (first..first + ROWS_PER_FILE).map(|id| format!("{id:08}{padding}")),
+        ));
+        let batch = RecordBatch::try_new(fixture.batch.schema(), columns).unwrap();
+        let output = fixture
+            .table
+            .file_io()
+            .new_output(format!(
+                "{}/rows-{file}.parquet",
+                fixture.table.metadata().location()
+            ))
+            .unwrap();
+        let mut writer = ParquetWriterBuilder::new(
+            WriterProperties::builder()
+                .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+                .set_statistics_enabled(EnabledStatistics::None)
+                .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
+                .build(),
+            fixture.table.metadata().current_schema().clone(),
+        )
+        .build(output)
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        files.extend(writer.close().await.unwrap().into_iter().map(|mut file| {
+            file.content(DataContentType::Data)
+                .partition(Struct::empty())
+                .partition_spec_id(0)
+                .build()
+                .unwrap()
+        }));
+    }
+    let tx = Transaction::new(&fixture.table);
+    let table = tx
+        .fast_append()
+        .add_data_files(files)
+        .apply(tx)
+        .unwrap()
+        .commit(&fixture.catalog)
+        .await
+        .unwrap();
+    let provider = IcebergTableProvider::try_new(table).unwrap();
+    let context = SessionContext::new_with_config(
+        SessionConfig::new()
+            .with_target_partitions(14)
+            .with_batch_size(19),
+    );
+    let projection = vec![0];
+    let plan = provider
+        .scan(&context.state(), Some(&projection), &[], None)
+        .await
+        .unwrap();
+    let partitions = collect_partitioned(plan, context.task_ctx()).await.unwrap();
+    assert_eq!(partitions.len(), 14);
+    let loads = partitions
+        .iter()
+        .map(|batches| batches.iter().map(RecordBatch::num_rows).sum::<usize>())
+        .collect::<Vec<_>>();
+    assert!(loads.iter().all(|rows| *rows > 0));
+    assert!(
+        *loads.iter().max().unwrap()
+            <= (ROWS_PER_FILE as usize * 8).div_ceil(loads.len()) + ROW_GROUP_ROWS,
+        "consumer rows: {loads:?}"
+    );
+    let mut ids = partitions
+        .into_iter()
+        .flatten()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, (0..ROWS_PER_FILE * 8).collect::<Vec<_>>());
 }
 
 #[tokio::test]

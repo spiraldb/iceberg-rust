@@ -80,7 +80,9 @@ impl IcebergScan {
         statistics.total_byte_size =
             usize::try_from(total_bytes).map_or(Precision::Absent, Precision::Inexact);
         let target_bytes = total_bytes.div_ceil(partitions as u64).max(1);
-        let mut work = Vec::new();
+        let mut groups = vec![Vec::new(); partitions];
+        let mut partition = 0;
+        let mut partition_bytes = 0;
         for task in tasks {
             if task.data_file_format() != iceberg::spec::DataFileFormat::Parquet {
                 return Err(DataFusionError::NotImplemented(
@@ -92,27 +94,24 @@ impl IcebergScan {
             })?;
             let mut start = task.start();
             while start < end {
-                let length = target_bytes.min(end - start);
-                work.push(
-                    task.clone()
-                        .with_byte_range(start, length)
-                        .map_err(external)?,
-                );
+                if partition_bytes == target_bytes {
+                    partition += 1;
+                    partition_bytes = 0;
+                }
+                let length = (target_bytes - partition_bytes).min(end - start);
+                groups
+                    .get_mut(partition)
+                    .ok_or_else(|| {
+                        DataFusionError::Plan("Iceberg scan partition byte budget overflow".into())
+                    })?
+                    .push(
+                        task.clone()
+                            .with_byte_range(start, length)
+                            .map_err(external)?,
+                    );
                 start += length;
+                partition_bytes += length;
             }
-        }
-        work.sort_unstable_by_key(|task| std::cmp::Reverse(task.length()));
-        let mut groups = vec![Vec::new(); partitions];
-        let mut bytes = vec![0u64; partitions];
-        for task in work {
-            let partition = bytes
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, size)| *size)
-                .unwrap()
-                .0;
-            bytes[partition] += task.length();
-            groups[partition].push(task);
         }
         Ok(Self {
             table,
