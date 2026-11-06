@@ -57,6 +57,14 @@ pub(crate) struct IcebergScan {
     dynamic_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
+fn should_read_in_background(partitions: usize) -> bool {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return true;
+    };
+    let available_cores = std::thread::available_parallelism().map_or(1, usize::from);
+    runtime.metrics().num_workers() < partitions.min(available_cores)
+}
+
 impl IcebergScan {
     pub(crate) fn try_new(
         table: Table,
@@ -223,7 +231,7 @@ impl ExecutionPlan for IcebergScan {
             .reader_builder()
             .with_batch_size(self.batch_size)
             .with_data_file_concurrency_limit(1)
-            .with_background_reads(true)
+            .with_background_reads(should_read_in_background(self.partitions.len()))
             .with_compute_time_observer(move |elapsed| compute.add_duration(elapsed));
         if !self.dynamic_filters.is_empty() {
             let filters = self.dynamic_filters.clone();

@@ -497,7 +497,16 @@ fn parallel_single_file_scans_preserve_projection_and_row_counts() {
         (fixture, plan, context.task_ctx())
     });
     cpu_runtime.shutdown_background();
-    let error = query_runtime.block_on(collect(plan, context)).unwrap_err();
+    let result = query_runtime.block_on(collect(plan, context));
+    if std::thread::available_parallelism().map_or(1, usize::from) <= 2 {
+        let batches = result.unwrap();
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            ROWS as usize
+        );
+        return;
+    }
+    let error = result.unwrap_err();
     let mut cause: &(dyn std::error::Error + 'static) = &error;
     loop {
         if let Some(join) = cause.downcast_ref::<tokio::task::JoinError>() {
@@ -508,6 +517,55 @@ fn parallel_single_file_scans_preserve_projection_and_row_counts() {
             .source()
             .expect("CPU executor cancellation must reach the consumer");
     }
+}
+
+#[test]
+fn query_workers_decode_without_cpu_executor() {
+    let query_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let cpu_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let runtime = Runtime::new_with_split(&query_runtime, &cpu_runtime);
+    let (_fixture, plan, context) = query_runtime.block_on(async {
+        let fixture = Fixture::new(true).await;
+        let provider =
+            IcebergTableProvider::try_new(fixture.table.clone().with_runtime(runtime)).unwrap();
+        let context = fixture.context();
+        let plan = provider
+            .scan(&context.state(), None, &[], None)
+            .await
+            .unwrap();
+        assert_eq!(plan.output_partitioning().partition_count(), 4);
+        (fixture, plan, context.task_ctx())
+    });
+    cpu_runtime.shutdown_background();
+    let outside_runtime = plan.execute(0, context.clone()).unwrap();
+    assert!(
+        query_runtime
+            .block_on(outside_runtime.try_collect::<Vec<_>>())
+            .is_err()
+    );
+    let batches = query_runtime.block_on(collect(plan, context)).unwrap();
+    let mut ids: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, (0..ROWS).collect::<Vec<_>>());
 }
 
 #[tokio::test]

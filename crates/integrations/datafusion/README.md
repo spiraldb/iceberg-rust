@@ -28,8 +28,10 @@ String and binary columns use the canonical Iceberg Arrow types, `Utf8` and
 Scans expose the session's target partition count, with a minimum of two. File
 byte ranges are balanced across consumers and own disjoint Parquet row groups.
 Each consumer has its own reader stream. Decoding runs on the table's CPU
-executor, with bounded buffering per partition and cancellation when a consumer
-stops. The table's I/O executor supplies asynchronous I/O and timer drivers.
+executor when the query runtime has fewer workers than the smaller of the scan's
+partition count and available CPU count. Otherwise the query workers decode
+directly. Background reads have bounded buffering per partition and cancel when
+a consumer stops. The table's I/O executor supplies asynchronous I/O and timers.
 Small files with one row group can leave some partitions empty.
 
 Projection, schema evolution, and Iceberg positional and equality deletes use
