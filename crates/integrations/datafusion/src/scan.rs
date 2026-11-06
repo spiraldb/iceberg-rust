@@ -224,7 +224,6 @@ impl ExecutionPlan for IcebergScan {
             .with_batch_size(self.batch_size)
             .with_data_file_concurrency_limit(1)
             .with_background_reads(true)
-            .with_view_types(true)
             .with_compute_time_observer(move |elapsed| compute.add_duration(elapsed));
         if !self.dynamic_filters.is_empty() {
             let filters = self.dynamic_filters.clone();

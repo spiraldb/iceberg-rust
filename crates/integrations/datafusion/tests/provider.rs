@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    ArrayRef, BinaryViewArray, BooleanArray, Float64Array, Int32Array, Int64Array,
-    LargeBinaryArray, StringArray, StringViewArray, StructArray,
+    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, LargeBinaryArray, StringArray,
+    StructArray,
 };
 use datafusion::arrow::buffer::NullBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -425,10 +425,10 @@ fn parallel_single_file_scans_preserve_projection_and_row_counts() {
             IcebergTableProvider::try_new(fixture.table.clone().with_runtime(runtime)).unwrap();
         let context = fixture.context();
         let state = context.state();
-        assert_eq!(provider.schema().field(1).data_type(), &DataType::Utf8View);
+        assert_eq!(provider.schema().field(1).data_type(), &DataType::Utf8);
         assert_eq!(
             provider.schema().field(5).data_type(),
-            &DataType::BinaryView
+            &DataType::LargeBinary
         );
         let DataType::Struct(payload) = provider.schema().field(3).data_type().clone() else {
             unreachable!()
@@ -452,8 +452,8 @@ fn parallel_single_file_scans_preserve_projection_and_row_counts() {
         for batch in partitions.into_iter().flatten() {
             assert_eq!(batch.schema().field(0).name(), "payload");
             assert_eq!(batch.schema().field(1).name(), "label");
-            assert_eq!(batch.column(1).data_type(), &DataType::Utf8View);
-            assert_eq!(batch.column(3).data_type(), &DataType::BinaryView);
+            assert_eq!(batch.column(1).data_type(), &DataType::Utf8);
+            assert_eq!(batch.column(3).data_type(), &DataType::LargeBinary);
             let column = batch
                 .column(2)
                 .as_any()
@@ -462,7 +462,7 @@ fn parallel_single_file_scans_preserve_projection_and_row_counts() {
             let blobs = batch
                 .column(3)
                 .as_any()
-                .downcast_ref::<BinaryViewArray>()
+                .downcast_ref::<LargeBinaryArray>()
                 .unwrap();
             assert_eq!(
                 blobs
@@ -766,7 +766,7 @@ async fn deletes_apply_across_split_ranges_and_unprojected_keys() {
             batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<StringViewArray>()
+                .downcast_ref::<StringArray>()
                 .unwrap()
                 .iter()
                 .map(|value| value.map(str::to_owned))
@@ -878,7 +878,7 @@ async fn added_columns_and_empty_snapshots_keep_their_schema() {
             batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<StringViewArray>()
+                .downcast_ref::<StringArray>()
                 .unwrap()
                 .iter()
                 .map(|value| value.map(str::to_owned))
@@ -900,7 +900,7 @@ async fn added_columns_and_empty_snapshots_keep_their_schema() {
             batch
                 .column(1)
                 .as_any()
-                .downcast_ref::<StringViewArray>()
+                .downcast_ref::<StringArray>()
                 .unwrap()
                 .iter()
                 .all(|value| value == Some("fallback"))
@@ -920,7 +920,7 @@ async fn added_columns_and_empty_snapshots_keep_their_schema() {
         .update(Arc::new(BinaryExpr::new(
             key,
             Operator::Eq,
-            Arc::new(PhysicalLiteral::new(ScalarValue::Utf8View(Some(
+            Arc::new(PhysicalLiteral::new(ScalarValue::Utf8(Some(
                 "fallback".to_owned(),
             )))),
         )))
@@ -938,10 +938,7 @@ async fn added_columns_and_empty_snapshots_keep_their_schema() {
         .scan(&context.state(), None, &[], None)
         .await
         .unwrap();
-    assert_eq!(
-        plan.schema().as_ref(),
-        &iceberg::arrow::schema_with_view_types(empty.batch.schema().as_ref())
-    );
+    assert_eq!(plan.schema().as_ref(), empty.batch.schema().as_ref());
     assert_eq!(plan.output_partitioning().partition_count(), 4);
     assert!(collect(plan, context.task_ctx()).await.unwrap().is_empty());
 }

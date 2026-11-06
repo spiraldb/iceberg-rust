@@ -29,7 +29,7 @@ use datafusion::common::stats::Precision;
 use datafusion::common::{DataFusionError, Result, Statistics};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
-use iceberg::arrow::{schema_to_arrow_schema, schema_with_view_types};
+use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 
 /// Exposes an immutable Iceberg table snapshot as parallel Parquet scans.
@@ -44,9 +44,8 @@ pub struct IcebergTableProvider {
 impl IcebergTableProvider {
     /// Creates a provider for the current schema and snapshot of `table`.
     pub fn try_new(table: Table) -> Result<Self> {
-        let schema = Arc::new(schema_with_view_types(
-            &schema_to_arrow_schema(table.metadata().current_schema()).map_err(external)?,
-        ));
+        let schema =
+            Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).map_err(external)?);
         Ok(Self { table, schema })
     }
 }
