@@ -22,9 +22,13 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result, Statistics};
+use datafusion::config::ConfigOptions;
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_expr::{DynamicFilterTracking, EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
+};
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
@@ -40,7 +44,9 @@ use iceberg::table::Table;
 
 use crate::external;
 
-#[derive(Debug)]
+mod dynamic_filter;
+
+#[derive(Debug, Clone)]
 pub(crate) struct IcebergScan {
     table: Table,
     partitions: Vec<Vec<FileScanTask>>,
@@ -48,6 +54,7 @@ pub(crate) struct IcebergScan {
     batch_size: usize,
     metrics: ExecutionPlanMetricsSet,
     statistics: Arc<Statistics>,
+    dynamic_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl IcebergScan {
@@ -125,6 +132,7 @@ impl IcebergScan {
             batch_size,
             metrics: ExecutionPlanMetricsSet::new(),
             statistics: Arc::new(statistics),
+            dynamic_filters: Vec::new(),
         })
     }
 }
@@ -133,9 +141,10 @@ impl DisplayAs for IcebergScan {
     fn fmt_as(&self, _: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "IcebergScan: partitions={}, tasks={}",
+            "IcebergScan: partitions={}, tasks={}, dynamic_filters={}",
             self.partitions.len(),
-            self.partitions.iter().map(Vec::len).sum::<usize>()
+            self.partitions.iter().map(Vec::len).sum::<usize>(),
+            self.dynamic_filters.len(),
         )
     }
 }
@@ -152,9 +161,43 @@ impl ExecutionPlan for IcebergScan {
     }
     fn apply_expressions(
         &self,
-        _: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        visitor: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
+        datafusion::physical_plan::apply_expression_roots(self.dynamic_filters.iter(), visitor)
+    }
+    fn handle_child_pushdown_result(
+        &self,
+        phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let filters = child_pushdown_result.parent_filters;
+        // Dynamic filters can be skipped for files whose fields cannot be adapted; retain every residual.
+        let propagation = FilterPushdownPropagation::with_parent_pushdown_result(vec![
+                PushedDown::No;
+                filters.len()
+            ]);
+        if phase != FilterPushdownPhase::Post {
+            return Ok(propagation);
+        }
+        let mut node = self.clone();
+        for filter in filters {
+            if DynamicFilterTracking::classify(&filter.filter).contains_dynamic_filter()
+                && !node
+                    .dynamic_filters
+                    .iter()
+                    .any(|existing| existing.eq(&filter.filter))
+            {
+                node.dynamic_filters.push(filter.filter);
+            }
+        }
+        if node.dynamic_filters.len() == self.dynamic_filters.len() {
+            return Ok(propagation);
+        }
+        let mut statistics = self.statistics.as_ref().clone();
+        statistics.num_rows = statistics.num_rows.to_inexact();
+        node.statistics = Arc::new(statistics);
+        Ok(propagation.with_updated_node(Arc::new(node)))
     }
     fn with_new_children(
         self: Arc<Self>,
@@ -175,14 +218,38 @@ impl ExecutionPlan for IcebergScan {
             .clone();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let compute = baseline.elapsed_compute().clone();
-        let native = self
+        let mut reader = self
             .table
             .reader_builder()
             .with_batch_size(self.batch_size)
             .with_data_file_concurrency_limit(1)
             .with_background_reads(true)
             .with_view_types(true)
-            .with_compute_time_observer(move |elapsed| compute.add_duration(elapsed))
+            .with_compute_time_observer(move |elapsed| compute.add_duration(elapsed));
+        if !self.dynamic_filters.is_empty() {
+            let filters = self.dynamic_filters.clone();
+            let schema = self.schema();
+            let pruned =
+                MetricBuilder::new(&self.metrics).counter("dynamic_filter_rows_pruned", partition);
+            reader = reader.with_row_filter_factory(move |task, physical_schema, metadata| {
+                dynamic_filter::row_filter(
+                    &filters,
+                    &schema,
+                    task,
+                    physical_schema,
+                    metadata,
+                    &pruned,
+                )
+                .map_err(|error| {
+                    iceberg::Error::new(
+                        iceberg::ErrorKind::Unexpected,
+                        "Cannot prepare dynamic Parquet filter",
+                    )
+                    .with_source(error)
+                })
+            });
+        }
+        let native = reader
             .build()
             .read(futures::stream::iter(tasks.into_iter().map(Ok)).boxed())
             .map_err(external)?;

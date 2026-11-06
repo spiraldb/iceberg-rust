@@ -28,8 +28,18 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::catalog::TableProvider;
 use datafusion::datasource::MemTable;
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{
+    BinaryExpr, Column, DynamicFilterPhysicalExpr, Literal as PhysicalLiteral,
+};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildFilterPushdownResult, ChildPushdownResult, FilterPushdownPhase, PushedDown,
+};
 use datafusion::physical_plan::{ExecutionPlanProperties, collect, collect_partitioned};
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
+use datafusion::scalar::ScalarValue;
+use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::{arrow_schema_to_schema_auto_assign_ids, schema_to_arrow_schema};
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -51,6 +61,28 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
 const ROWS: i64 = 257;
+
+fn with_dynamic_filter(
+    plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    filter: Arc<DynamicFilterPhysicalExpr>,
+    context: &SessionContext,
+) -> Arc<dyn datafusion::physical_plan::ExecutionPlan> {
+    let result = plan
+        .handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            ChildPushdownResult {
+                parent_filters: vec![ChildFilterPushdownResult {
+                    filter,
+                    child_results: vec![],
+                }],
+                self_filters: vec![],
+            },
+            context.state().config_options(),
+        )
+        .unwrap();
+    assert!(matches!(result.filters.as_slice(), [PushedDown::No]));
+    result.updated_node.unwrap()
+}
 
 struct Fixture {
     _root: TempDir,
@@ -624,6 +656,60 @@ async fn pushed_and_residual_filters_match_datafusion() {
         }
         assert_eq!(results[0], results[1], "filter: {filter}");
     }
+    let keys = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "join_key",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![5, 19, 205]))],
+    )
+    .unwrap();
+    context
+        .register_table(
+            "keys",
+            Arc::new(MemTable::try_new(keys.schema(), vec![vec![keys]]).unwrap()),
+        )
+        .unwrap();
+    let plan = context
+        .sql("SELECT data.id FROM keys JOIN ice data ON keys.join_key = data.id ORDER BY data.id")
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let mut nodes = vec![plan.clone()];
+    let mut scan = None;
+    while let Some(node) = nodes.pop() {
+        if node.name() == "IcebergScan" {
+            scan = Some(node.clone());
+        }
+        nodes.extend(node.children().into_iter().cloned());
+    }
+    let batches = collect(plan, context.task_ctx()).await.unwrap();
+    let ids = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![5, 19, 205]);
+    assert!(
+        scan.unwrap()
+            .metrics()
+            .unwrap()
+            .iter()
+            .filter(|metric| metric.value().name() == "dynamic_filter_rows_pruned")
+            .map(|metric| metric.value().as_usize())
+            .sum::<usize>()
+            > 0
+    );
 }
 
 #[tokio::test]
@@ -820,6 +906,32 @@ async fn added_columns_and_empty_snapshots_keep_their_schema() {
                 .all(|value| value == Some("fallback"))
         );
     }
+    let projection = vec![8, 0];
+    let plan = provider
+        .scan(&context.state(), Some(&projection), &[], None)
+        .await
+        .unwrap();
+    let key: Arc<dyn PhysicalExpr> = Arc::new(Column::new("default_string", 0));
+    let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+        vec![key.clone()],
+        Arc::new(PhysicalLiteral::new(ScalarValue::Boolean(Some(true)))),
+    ));
+    dynamic
+        .update(Arc::new(BinaryExpr::new(
+            key,
+            Operator::Eq,
+            Arc::new(PhysicalLiteral::new(ScalarValue::Utf8View(Some(
+                "fallback".to_owned(),
+            )))),
+        )))
+        .unwrap();
+    let plan = with_dynamic_filter(plan, dynamic, &context);
+    let batches = collect(plan, context.task_ctx()).await.unwrap();
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        ROWS as usize
+    );
+
     let empty = Fixture::new(false).await;
     let provider = IcebergTableProvider::try_new(empty.table).unwrap();
     let plan = provider
@@ -893,4 +1005,86 @@ async fn promoted_integer_predicates_preserve_out_of_range_literals() {
         }
         assert_eq!(results[0], results[1], "filter: {filter}");
     }
+}
+
+#[tokio::test]
+async fn dynamic_filters_remain_live_after_projection_and_field_rename() {
+    let mut fixture = Fixture::new(true).await;
+    fixture.add_deletes().await;
+    fixture.evolve_field(0, |field| field.name = "key".to_owned());
+    let provider = IcebergTableProvider::try_new(fixture.table.clone()).unwrap();
+    let context = SessionContext::new_with_config(
+        SessionConfig::new()
+            .with_target_partitions(2)
+            .with_batch_size(8),
+    );
+    let projection = vec![1, 0];
+    let plan = provider
+        .scan(
+            &context.state(),
+            Some(&projection),
+            &[col("key").gt(lit(50_i64))],
+            None,
+        )
+        .await
+        .unwrap();
+    let baseline = plan
+        .execute(0, context.task_ctx())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let baseline_rows = baseline.iter().map(RecordBatch::num_rows).sum::<usize>();
+    assert!(baseline_rows > 32);
+    let key: Arc<dyn PhysicalExpr> = Arc::new(Column::new("key", 1));
+    let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+        vec![key.clone()],
+        Arc::new(PhysicalLiteral::new(ScalarValue::Boolean(Some(true)))),
+    ));
+    let plan = with_dynamic_filter(plan, dynamic.clone(), &context);
+    let mut visited = false;
+    plan.apply_expressions(&mut |expression| {
+        visited |= expression.expression_id() == dynamic.expression_id();
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    })
+    .unwrap();
+    assert!(visited);
+    let mut input = plan.execute(0, context.task_ctx()).unwrap();
+    let first = input.next().await.unwrap().unwrap();
+    dynamic
+        .update(Arc::new(BinaryExpr::new(
+            key,
+            Operator::GtEq,
+            Arc::new(PhysicalLiteral::new(ScalarValue::Int64(Some(200)))),
+        )))
+        .unwrap();
+    let later = input.try_collect::<Vec<_>>().await.unwrap();
+    assert!(
+        first.num_rows() + later.iter().map(RecordBatch::num_rows).sum::<usize>() < baseline_rows
+    );
+    dynamic.mark_complete();
+    let batches = collect(plan.clone(), context.task_ctx()).await.unwrap();
+    let mut keys = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(keys, (200..255).collect::<Vec<_>>());
+    assert!(
+        plan.metrics()
+            .unwrap()
+            .iter()
+            .filter(|metric| metric.value().name() == "dynamic_filter_rows_pruned")
+            .map(|metric| metric.value().as_usize())
+            .sum::<usize>()
+            > 0
+    );
 }
