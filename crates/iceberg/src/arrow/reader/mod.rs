@@ -17,6 +17,9 @@
 
 //! Parquet file data reader
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
@@ -33,6 +36,8 @@ const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 10;
 /// Default number of bytes to prefetch when parsing Parquet footer metadata.
 /// Matches DataFusion's default `ParquetOptions::metadata_size_hint`.
 const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
+
+type ComputeTimeObserver = Arc<dyn Fn(Duration) + Send + Sync>;
 
 mod background;
 mod file_reader;
@@ -63,6 +68,7 @@ pub struct ArrowReaderBuilder {
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
     background_reads: bool,
+    compute_time_observer: Option<ComputeTimeObserver>,
 }
 
 impl ArrowReaderBuilder {
@@ -80,6 +86,7 @@ impl ArrowReaderBuilder {
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
             background_reads: false,
+            compute_time_observer: None,
         }
     }
 
@@ -99,6 +106,13 @@ impl ArrowReaderBuilder {
     /// Drives reads on the configured CPU runtime with bounded batch prefetching.
     pub fn with_background_reads(mut self, background_reads: bool) -> Self {
         self.background_reads = background_reads;
+        self
+    }
+
+    /// Observes the duration of each background reader poll on its producer thread.
+    pub fn with_compute_time_observer<F>(mut self, observer: F) -> Self
+    where F: Fn(Duration) + Send + Sync + 'static {
+        self.compute_time_observer = Some(Arc::new(observer));
         self
     }
 
@@ -171,6 +185,7 @@ impl ArrowReaderBuilder {
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
             background_runtime: self.background_reads.then_some(self.runtime),
+            compute_time_observer: self.compute_time_observer,
         }
     }
 }
@@ -190,4 +205,5 @@ pub struct ArrowReader {
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     background_runtime: Option<Runtime>,
+    compute_time_observer: Option<ComputeTimeObserver>,
 }

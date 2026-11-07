@@ -74,6 +74,7 @@ pub fn iceberg::arrow::ArrowReaderBuilder::new(file_io: iceberg::io::FileIO, run
 pub fn iceberg::arrow::ArrowReaderBuilder::with_background_reads(self, background_reads: bool) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_batch_size(self, batch_size: usize) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_bloom_filter_enabled(self, bloom_filter_enabled: bool) -> Self
+pub fn iceberg::arrow::ArrowReaderBuilder::with_compute_time_observer<F>(self, observer: F) -> Self where F: core::ops::function::Fn(core::time::Duration) + core::marker::Send + core::marker::Sync + 'static
 pub fn iceberg::arrow::ArrowReaderBuilder::with_data_file_concurrency_limit(self, val: usize) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_metadata_size_hint(self, metadata_size_hint: usize) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_range_coalesce_bytes(self, range_coalesce_bytes: u64) -> Self
