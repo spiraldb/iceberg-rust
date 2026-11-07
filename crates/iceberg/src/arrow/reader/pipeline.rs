@@ -114,7 +114,7 @@ impl ArrowReader {
                 scan_metrics.clone(),
                 self.compute_time_observer,
             ),
-            None => stream,
+            None => super::background::read_in_foreground(stream, self.io_runtime),
         };
         Ok(ScanResult::new(stream, scan_metrics))
     }
