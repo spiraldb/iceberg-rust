@@ -34,7 +34,7 @@ use arrow_string::like::starts_with;
 use fnv::FnvHashSet;
 use parquet::schema::types::SchemaDescriptor;
 
-use crate::arrow::get_arrow_datum;
+use crate::arrow::{get_arrow_datum, type_to_arrow_type};
 use crate::error::{Result, invalid_data};
 use crate::expr::visitors::bound_predicate_visitor::BoundPredicateVisitor;
 use crate::expr::{BoundPredicate, BoundReference};
@@ -424,12 +424,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
+            let mut operands = PredicateOperands::new(reference, [literal])?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                lt(&left, literal.as_ref())
+                let left = operands.column(project_column(&batch, idx)?)?;
+                lt(&left, operands.literals[0].as_ref())
             }))
         } else {
             // A missing column, treating it as null.
@@ -444,12 +443,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
+            let mut operands = PredicateOperands::new(reference, [literal])?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                lt_eq(&left, literal.as_ref())
+                let left = operands.column(project_column(&batch, idx)?)?;
+                lt_eq(&left, operands.literals[0].as_ref())
             }))
         } else {
             // A missing column, treating it as null.
@@ -464,12 +462,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
+            let mut operands = PredicateOperands::new(reference, [literal])?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                gt(&left, literal.as_ref())
+                let left = operands.column(project_column(&batch, idx)?)?;
+                gt(&left, operands.literals[0].as_ref())
             }))
         } else {
             // A missing column, treating it as null.
@@ -484,12 +481,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
+            let mut operands = PredicateOperands::new(reference, [literal])?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                gt_eq(&left, literal.as_ref())
+                let left = operands.column(project_column(&batch, idx)?)?;
+                gt_eq(&left, operands.literals[0].as_ref())
             }))
         } else {
             // A missing column, treating it as null.
@@ -504,12 +500,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
+            let mut operands = PredicateOperands::new(reference, [literal])?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                eq(&left, literal.as_ref())
+                let left = operands.column(project_column(&batch, idx)?)?;
+                eq(&left, operands.literals[0].as_ref())
             }))
         } else {
             // A missing column, treating it as null.
@@ -524,12 +519,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
+            let mut operands = PredicateOperands::new(reference, [literal])?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                neq(&left, literal.as_ref())
+                let left = operands.column(project_column(&batch, idx)?)?;
+                neq(&left, operands.literals[0].as_ref())
             }))
         } else {
             // A missing column, treating it as null.
@@ -585,18 +579,13 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
-            let literals: Vec<_> = literals
-                .iter()
-                .map(|lit| get_arrow_datum(lit).unwrap())
-                .collect();
+            let mut operands = PredicateOperands::new(reference, literals)?;
 
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native is_in kernel
-                let left = project_column(&batch, idx)?;
-
+                let left = operands.column(project_column(&batch, idx)?)?;
                 let mut acc = constant_bool_array(false, batch.num_rows());
-                for literal in &literals {
-                    let literal = try_cast_literal(literal, left.data_type())?;
+                for literal in &operands.literals {
                     acc = or(&acc, &eq(&left, literal.as_ref())?)?
                 }
 
@@ -615,17 +604,13 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
-            let literals: Vec<_> = literals
-                .iter()
-                .map(|lit| get_arrow_datum(lit).unwrap())
-                .collect();
+            let mut operands = PredicateOperands::new(reference, literals)?;
 
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native not_in kernel
-                let left = project_column(&batch, idx)?;
+                let left = operands.column(project_column(&batch, idx)?)?;
                 let mut acc = constant_bool_array(true, batch.num_rows());
-                for literal in &literals {
-                    let literal = try_cast_literal(literal, left.data_type())?;
+                for literal in &operands.literals {
                     acc = and(&acc, &neq(&left, literal.as_ref())?)?
                 }
 
@@ -634,6 +619,67 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         } else {
             // A missing column, treating it as null.
             self.build_always_true()
+        }
+    }
+}
+
+struct PredicateOperands {
+    literals: Vec<Arc<dyn ArrowDatum + Send + Sync>>,
+    logical_type: DataType,
+    prepared: bool,
+    promote_column: bool,
+}
+
+impl PredicateOperands {
+    fn new<'a>(
+        reference: &BoundReference,
+        literals: impl IntoIterator<Item = &'a Datum>,
+    ) -> Result<Self> {
+        Ok(Self {
+            literals: literals
+                .into_iter()
+                .map(get_arrow_datum)
+                .collect::<Result<_>>()?,
+            logical_type: type_to_arrow_type(&reference.field().field_type)?,
+            prepared: false,
+            promote_column: false,
+        })
+    }
+
+    fn column(&mut self, column: ArrayRef) -> std::result::Result<ArrayRef, ArrowError> {
+        if !self.prepared {
+            let narrowed = self
+                .literals
+                .iter()
+                .map(|literal| try_cast_literal(literal, column.data_type()))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let promotion = match (column.data_type(), &self.logical_type) {
+                (DataType::Int32, DataType::Int64) | (DataType::Float32, DataType::Float64) => true,
+                (
+                    DataType::Decimal128(source_precision, source_scale),
+                    DataType::Decimal128(target_precision, target_scale),
+                ) => source_precision < target_precision && source_scale == target_scale,
+                _ => false,
+            };
+            if promotion {
+                for (original, narrowed) in self.literals.iter().zip(&narrowed) {
+                    let round_trip = try_cast_literal(narrowed, &self.logical_type)?;
+                    let equal = eq(original.as_ref(), round_trip.as_ref())?;
+                    if equal.is_null(0) || !equal.value(0) {
+                        self.promote_column = true;
+                        break;
+                    }
+                }
+            }
+            if !self.promote_column {
+                self.literals = narrowed;
+            }
+            self.prepared = true;
+        }
+        if self.promote_column {
+            cast(column.as_ref(), &self.logical_type)
+        } else {
+            Ok(column)
         }
     }
 }
@@ -664,15 +710,16 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
-    use arrow_array::{Array, BooleanArray, RecordBatch};
+    use arrow_array::{
+        Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Int32Array, RecordBatch,
+    };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use parquet::schema::parser::parse_message_type;
-    use parquet::schema::types::SchemaDescriptor;
+    use parquet::arrow::ArrowSchemaConverter;
 
     use super::{CollectFieldIdVisitor, PredicateConverter, constant_bool_array};
     use crate::expr::visitors::bound_predicate_visitor::visit;
     use crate::expr::{Bind, Predicate, Reference};
-    use crate::spec::{NestedField, PrimitiveType, Schema, SchemaRef, Type};
+    use crate::spec::{Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
 
     fn table_schema_simple() -> SchemaRef {
         Arc::new(
@@ -769,14 +816,9 @@ mod tests {
     ) -> BooleanArray {
         let bound = predicate.bind(schema, true).unwrap();
 
-        // Build a trivial Parquet schema with one float column at field id 4
-        let message_type = "
-            message schema {
-              optional float qux = 4;
-            }
-        ";
-        let parquet_type = parse_message_type(message_type).expect("parse schema");
-        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
+        let parquet_schema = ArrowSchemaConverter::new()
+            .convert(batch.schema().as_ref())
+            .unwrap();
 
         let column_map = HashMap::from([(4i32, 0usize)]);
         let column_indices = vec![0usize];
@@ -792,9 +834,93 @@ mod tests {
     }
 
     #[test]
-    fn test_predicate_converter_nan() {
-        use arrow_array::Float32Array;
+    fn test_predicate_comparisons_preserve_promoted_values() {
+        for (column, logical_type, literal, member, expected_less, expected_in) in [
+            (
+                Arc::new(Int32Array::from(vec![Some(0), Some(1), None])) as ArrayRef,
+                PrimitiveType::Long,
+                Datum::long(i64::from(i32::MAX) + 1),
+                Datum::long(1),
+                vec![Some(true), Some(true), None],
+                vec![Some(false), Some(true), None],
+            ),
+            (
+                Arc::new(Float32Array::from(vec![Some(0.1), Some(0.2), None])) as ArrayRef,
+                PrimitiveType::Double,
+                Datum::double(0.1),
+                Datum::double(0.2),
+                vec![Some(false), Some(false), None],
+                vec![Some(false), Some(false), None],
+            ),
+            (
+                Arc::new(
+                    Decimal128Array::from(vec![Some(123), Some(456), None])
+                        .with_precision_and_scale(3, 2)
+                        .unwrap(),
+                ) as ArrayRef,
+                PrimitiveType::Decimal {
+                    precision: 9,
+                    scale: 2,
+                },
+                Datum::decimal_from_str("1000.00").unwrap(),
+                Datum::decimal_from_str("1.23").unwrap(),
+                vec![Some(true), Some(true), None],
+                vec![Some(true), Some(false), None],
+            ),
+        ] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::optional(4, "qux", Type::Primitive(logical_type)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            let batch = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![Field::new(
+                    "qux",
+                    column.data_type().clone(),
+                    true,
+                )])),
+                vec![column],
+            )
+            .unwrap();
+            let reference = Reference::new("qux");
+            let cases = [
+                (reference.clone().less_than(literal.clone()), expected_less),
+                (reference.clone().equal_to(literal.clone()), vec![
+                    Some(false),
+                    Some(false),
+                    None,
+                ]),
+                (reference.clone().not_equal_to(literal.clone()), vec![
+                    Some(true),
+                    Some(true),
+                    None,
+                ]),
+                (
+                    reference.clone().is_in([literal.clone(), member.clone()]),
+                    expected_in.clone(),
+                ),
+                (
+                    reference.is_not_in([literal, member]),
+                    expected_in
+                        .into_iter()
+                        .map(|value| value.map(|value| !value))
+                        .collect(),
+                ),
+            ];
+            for (predicate, expected) in cases {
+                assert_eq!(
+                    apply_predicate_to_batch(predicate, schema.clone(), batch.clone()),
+                    BooleanArray::from(expected),
+                );
+            }
+        }
+    }
 
+    #[test]
+    fn test_predicate_converter_nan() {
         let schema = table_schema_simple();
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "qux",
