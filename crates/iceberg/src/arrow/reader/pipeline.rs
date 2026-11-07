@@ -27,7 +27,7 @@ use std::sync::atomic::AtomicU64;
 
 use arrow_schema::{DataType, Field};
 use futures::{StreamExt, TryStreamExt};
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowFilter};
 use parquet::arrow::{
     PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask, RowNumber,
 };
@@ -35,8 +35,9 @@ use parquet::encryption::decrypt::FileDecryptionProperties;
 
 use super::row_lineage::synthesize_row_id_column;
 use super::{
-    ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
-    apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
+    ArrowFileReader, ArrowReader, ParquetReadOptions, RowFilterFactory,
+    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
+    find_leaf_by_field_id,
 };
 use crate::arrow::build_partition_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
@@ -78,6 +79,7 @@ impl ArrowReader {
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
             scan_metrics: scan_metrics.clone(),
+            row_filter_factory: self.row_filter_factory,
         };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
@@ -142,6 +144,7 @@ struct FileScanTaskReader {
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     scan_metrics: ScanMetrics,
+    row_filter_factory: Option<RowFilterFactory>,
 }
 
 // Borrow an existing selection, or enumerate all groups for a whole-file scan.
@@ -536,6 +539,16 @@ impl FileScanTaskReader {
         // by using a `RowSelection`.
         let mut selected_row_group_indices = None;
         let mut row_selection = None;
+        let mut row_filter_predicates = match &self.row_filter_factory {
+            Some(factory) => factory(
+                &task,
+                record_batch_stream_builder.schema(),
+                record_batch_stream_builder.metadata(),
+            )?
+            .map(RowFilter::into_predicates)
+            .unwrap_or_default(),
+            None => Vec::new(),
+        };
 
         // Filter row groups based on byte range from task.start and task.length.
         // If both start and length are 0, read the entire file (backwards compatibility).
@@ -570,7 +583,7 @@ impl FileScanTaskReader {
                 &iceberg_field_ids,
                 &field_id_map,
             )?;
-            record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
+            row_filter_predicates.extend(row_filter.into_predicates());
 
             if self.row_group_filtering_enabled {
                 let candidates = candidate_row_groups(
@@ -615,6 +628,11 @@ impl FileScanTaskReader {
                     task.schema(),
                 )?;
             }
+        }
+
+        if !row_filter_predicates.is_empty() {
+            record_batch_stream_builder =
+                record_batch_stream_builder.with_row_filter(RowFilter::new(row_filter_predicates));
         }
 
         let positional_delete_indexes = delete_filter.get_delete_vector(&task);
@@ -1261,6 +1279,90 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         file_path
+    }
+
+    #[tokio::test]
+    async fn test_row_filter_factory_filters_unprojected_columns_with_native_predicates() {
+        let dir = TempDir::new().unwrap();
+        let file_path = write_plain_parquet(
+            dir.path().to_str().unwrap(),
+            "factory.parquet",
+            vec![],
+            vec![],
+        );
+        let schema = id_and_wide_schema();
+        let native = crate::expr::Bind::bind(
+            &crate::expr::Reference::new("id").less_than(crate::spec::Datum::int(3)),
+            schema.clone(),
+            false,
+        )
+        .unwrap();
+
+        for (use_factory, use_native, expected_positions) in [
+            (true, false, vec![0, 2]),
+            (true, true, vec![0]),
+            (false, true, vec![0, 1]),
+        ] {
+            let task = FileScanTask::builder()
+                .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(file_path.clone())
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![RESERVED_FIELD_ID_POS])
+                .with_predicate(use_native.then(|| native.clone()))
+                .with_case_sensitive(false)
+                .build()
+                .unwrap();
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                .with_row_filter_factory(move |_, physical_schema, metadata| {
+                    assert_eq!(
+                        physical_schema.field(0).metadata()[PARQUET_FIELD_ID_META_KEY],
+                        "1"
+                    );
+                    if !use_factory {
+                        return Ok(None);
+                    }
+                    let projection = parquet::arrow::ProjectionMask::roots(
+                        metadata.file_metadata().schema_descr(),
+                        [0],
+                    );
+                    let predicate =
+                        parquet::arrow::arrow_reader::ArrowPredicateFn::new(projection, |batch| {
+                            Ok(arrow_array::BooleanArray::from_iter(
+                                batch
+                                    .column(0)
+                                    .as_primitive::<arrow_array::types::Int32Type>()
+                                    .values()
+                                    .iter()
+                                    .map(|value| Some(*value != 2)),
+                            ))
+                        });
+                    Ok(Some(parquet::arrow::arrow_reader::RowFilter::new(vec![
+                        Box::new(predicate),
+                    ])))
+                })
+                .build();
+            let batches: Vec<RecordBatch> = reader
+                .read(Box::pin(futures::stream::iter([Ok(task)])))
+                .unwrap()
+                .stream()
+                .try_collect()
+                .await
+                .unwrap();
+            let positions: Vec<i64> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_primitive::<arrow_array::types::Int64Type>()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(positions, expected_positions);
+        }
     }
 
     fn last_updated_seq_task(

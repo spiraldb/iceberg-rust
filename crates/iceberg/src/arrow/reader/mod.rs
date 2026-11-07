@@ -20,6 +20,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow_schema::SchemaRef;
+use parquet::arrow::arrow_reader::RowFilter;
+use parquet::file::metadata::ParquetMetaData;
+
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
@@ -38,6 +42,15 @@ const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 10;
 const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
 
 type ComputeTimeObserver = Arc<dyn Fn(Duration) + Send + Sync>;
+type RowFilterFactory = Arc<
+    dyn Fn(
+            &crate::scan::FileScanTask,
+            &SchemaRef,
+            &Arc<ParquetMetaData>,
+        ) -> crate::Result<Option<RowFilter>>
+        + Send
+        + Sync,
+>;
 
 mod background;
 mod file_reader;
@@ -69,6 +82,7 @@ pub struct ArrowReaderBuilder {
     runtime: Runtime,
     background_reads: bool,
     compute_time_observer: Option<ComputeTimeObserver>,
+    row_filter_factory: Option<RowFilterFactory>,
 }
 
 impl ArrowReaderBuilder {
@@ -87,6 +101,7 @@ impl ArrowReaderBuilder {
             runtime,
             background_reads: false,
             compute_time_observer: None,
+            row_filter_factory: None,
         }
     }
 
@@ -113,6 +128,24 @@ impl ArrowReaderBuilder {
     pub fn with_compute_time_observer<F>(mut self, observer: F) -> Self
     where F: Fn(Duration) + Send + Sync + 'static {
         self.compute_time_observer = Some(Arc::new(observer));
+        self
+    }
+
+    /// Adds per-file Parquet row filters before the scan and delete predicates.
+    ///
+    /// The factory receives the full physical schema with resolved field IDs and
+    /// must return a fresh filter for each file. Returning `None` leaves that file
+    /// unfiltered by the factory. Filters must preserve rows needed by the caller.
+    pub fn with_row_filter_factory<F>(mut self, factory: F) -> Self
+    where F: Fn(
+                &crate::scan::FileScanTask,
+                &SchemaRef,
+                &Arc<ParquetMetaData>,
+            ) -> crate::Result<Option<RowFilter>>
+            + Send
+            + Sync
+            + 'static {
+        self.row_filter_factory = Some(Arc::new(factory));
         self
     }
 
@@ -186,6 +219,7 @@ impl ArrowReaderBuilder {
             parquet_read_options: self.parquet_read_options,
             background_runtime: self.background_reads.then_some(self.runtime),
             compute_time_observer: self.compute_time_observer,
+            row_filter_factory: self.row_filter_factory,
         }
     }
 }
@@ -206,4 +240,5 @@ pub struct ArrowReader {
     parquet_read_options: ParquetReadOptions,
     background_runtime: Option<Runtime>,
     compute_time_observer: Option<ComputeTimeObserver>,
+    row_filter_factory: Option<RowFilterFactory>,
 }

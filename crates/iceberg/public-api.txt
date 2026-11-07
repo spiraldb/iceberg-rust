@@ -79,6 +79,7 @@ pub fn iceberg::arrow::ArrowReaderBuilder::with_data_file_concurrency_limit(self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_metadata_size_hint(self, metadata_size_hint: usize) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_range_coalesce_bytes(self, range_coalesce_bytes: u64) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_range_fetch_concurrency(self, range_fetch_concurrency: usize) -> Self
+pub fn iceberg::arrow::ArrowReaderBuilder::with_row_filter_factory<F>(self, factory: F) -> Self where F: core::ops::function::Fn(&iceberg::scan::FileScanTask, &arrow_schema::schema::SchemaRef, &alloc::rcs::arc::Arc<parquet::file::metadata::ParquetMetaData>) -> iceberg::Result<core::option::Option<parquet::arrow::arrow_reader::filter::RowFilter>> + core::marker::Send + core::marker::Sync + 'static
 pub fn iceberg::arrow::ArrowReaderBuilder::with_row_group_filtering_enabled(self, row_group_filtering_enabled: bool) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_row_selection_enabled(self, row_selection_enabled: bool) -> Self
 pub struct iceberg::arrow::PartitionValueCalculator
