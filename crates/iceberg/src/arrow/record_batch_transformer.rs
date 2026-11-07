@@ -36,7 +36,7 @@ use crate::arrow::schema::try_get_field_id_from_metadata;
 use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
 use crate::arrow::{
     datum_to_arrow_type_with_ree, primitive_type_to_arrow_type_with_ree, schema_to_arrow_schema,
-    type_to_arrow_type,
+    schema_with_view_types, type_to_arrow_type,
 };
 use crate::error::invalid_data;
 use crate::metadata_columns::{
@@ -518,6 +518,7 @@ enum SchemaComparison {
 #[derive(Debug)]
 pub(crate) struct RecordBatchTransformerBuilder {
     snapshot_schema: Arc<IcebergSchema>,
+    view_types: bool,
     projected_iceberg_field_ids: Vec<i32>,
     constant_fields: HashMap<i32, ColumnConstant>,
     virtual_fields: HashSet<i32>,
@@ -589,10 +590,16 @@ impl RecordBatchTransformerBuilder {
     ) -> Self {
         Self {
             snapshot_schema,
+            view_types: false,
             projected_iceberg_field_ids: projected_iceberg_field_ids.to_vec(),
             constant_fields: HashMap::new(),
             virtual_fields: HashSet::new(),
         }
+    }
+
+    pub(crate) fn with_view_types(mut self, view_types: bool) -> Self {
+        self.view_types = view_types;
+        self
     }
 
     /// Add a scalar constant value for a specific field ID.
@@ -682,6 +689,7 @@ impl RecordBatchTransformerBuilder {
     pub(crate) fn build(self) -> RecordBatchTransformer {
         RecordBatchTransformer {
             snapshot_schema: self.snapshot_schema,
+            view_types: self.view_types,
             projected_iceberg_field_ids: self.projected_iceberg_field_ids,
             constant_fields: self.constant_fields,
             virtual_fields: self.virtual_fields,
@@ -723,6 +731,7 @@ impl RecordBatchTransformerBuilder {
 #[derive(Debug)]
 pub(crate) struct RecordBatchTransformer {
     snapshot_schema: Arc<IcebergSchema>,
+    view_types: bool,
     projected_iceberg_field_ids: Vec<i32>,
     // Unified map of all per-file constant columns (metadata, identity partition, _partition struct).
     constant_fields: HashMap<i32, ColumnConstant>,
@@ -775,6 +784,7 @@ impl RecordBatchTransformer {
                 self.batch_transform = Some(Self::generate_batch_transform(
                     record_batch.schema_ref(),
                     self.snapshot_schema.as_ref(),
+                    self.view_types,
                     &self.projected_iceberg_field_ids,
                     &self.constant_fields,
                     &self.virtual_fields,
@@ -795,11 +805,17 @@ impl RecordBatchTransformer {
     fn generate_batch_transform(
         source_schema: &ArrowSchemaRef,
         snapshot_schema: &IcebergSchema,
+        view_types: bool,
         projected_iceberg_field_ids: &[i32],
         constant_fields: &HashMap<i32, ColumnConstant>,
         virtual_fields: &HashSet<i32>,
     ) -> Result<BatchTransform> {
-        let mapped_unprojected_arrow_schema = Arc::new(schema_to_arrow_schema(snapshot_schema)?);
+        let mapped_unprojected_arrow_schema = schema_to_arrow_schema(snapshot_schema)?;
+        let mapped_unprojected_arrow_schema = Arc::new(if view_types {
+            schema_with_view_types(&mapped_unprojected_arrow_schema)
+        } else {
+            mapped_unprojected_arrow_schema
+        });
         let field_id_to_mapped_schema_map =
             Self::build_field_id_to_arrow_schema_map(&mapped_unprojected_arrow_schema)?;
 
@@ -2897,6 +2913,15 @@ mod test {
     /// - Java impl: core/src/main/java/org/apache/iceberg/util/PartitionUtil.java
     #[test]
     fn identity_partition_uses_constant_from_metadata() {
+        identity_partition_uses_constant_from_metadata_with_views(false);
+    }
+
+    #[test]
+    fn identity_partition_uses_string_view_constant_from_metadata() {
+        identity_partition_uses_constant_from_metadata_with_views(true);
+    }
+
+    fn identity_partition_uses_constant_from_metadata_with_views(view_types: bool) {
         use crate::spec::{Struct, Transform};
 
         // Table schema: id (data column), dept (partition column), name (data column)
@@ -2926,22 +2951,28 @@ mod test {
         let partition_data = Struct::from_iter(vec![Some(Literal::string("engineering"))]);
 
         // Parquet file contains only id and name (dept is in partition path)
+        let string_type = if view_types {
+            DataType::Utf8View
+        } else {
+            DataType::Utf8
+        };
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             field_with_id("id", DataType::Int32, false, 1),
-            field_with_id("name", DataType::Utf8, true, 3),
+            field_with_id("name", string_type.clone(), true, 3),
         ]));
 
         let projected_field_ids = [1, 2, 3]; // id, dept, name
 
         let mut transformer =
             RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
+                .with_view_types(view_types)
                 .with_partition(partition_spec, partition_data)
                 .expect("Failed to add partition constants")
                 .build();
 
         let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
             Arc::new(Int32Array::from(vec![100, 200])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+            cast(&StringArray::from(vec!["Alice", "Bob"]), &string_type).unwrap(),
         ])
         .unwrap();
 
@@ -2950,24 +2981,23 @@ mod test {
         // Verify the dept column is populated with the constant from partition metadata
         assert_eq!(result.num_columns(), 3);
         assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.schema().field(1).data_type(), &string_type);
+        assert_eq!(result.schema().field(2).data_type(), &string_type);
+
+        let dept = cast(result.column(1), &DataType::Utf8).unwrap();
+        let name = cast(result.column(2), &DataType::Utf8).unwrap();
 
         // Use helpers to handle both simple and REE arrays
         assert_eq!(get_int_value(result.column(0).as_ref(), 0), 100);
         assert_eq!(get_int_value(result.column(0).as_ref(), 1), 200);
 
-        // dept column comes from partition metadata (constant) - will be REE
-        assert_eq!(
-            get_string_value(result.column(1).as_ref(), 0),
-            "engineering"
-        );
-        assert_eq!(
-            get_string_value(result.column(1).as_ref(), 1),
-            "engineering"
-        );
+        // dept column comes from partition metadata.
+        assert_eq!(get_string_value(dept.as_ref(), 0), "engineering");
+        assert_eq!(get_string_value(dept.as_ref(), 1), "engineering");
 
         // name column comes from file
-        assert_eq!(get_string_value(result.column(2).as_ref(), 0), "Alice");
-        assert_eq!(get_string_value(result.column(2).as_ref(), 1), "Bob");
+        assert_eq!(get_string_value(name.as_ref(), 0), "Alice");
+        assert_eq!(get_string_value(name.as_ref(), 1), "Bob");
     }
 
     /// `identity(s.region)` with `region` absent from the file struct. The constant

@@ -35,6 +35,7 @@ use parquet::file::statistics::Statistics;
 use uuid::Uuid;
 
 use crate::error::{Result, invalid_data};
+use crate::metadata_columns::is_metadata_field;
 use crate::spec::decimal_utils::i128_from_be_bytes;
 use crate::spec::{
     Datum, FIRST_FIELD_ID, LIST_FIELD_NAME, ListType, MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME,
@@ -816,6 +817,27 @@ pub fn type_to_arrow_type(ty: &Type) -> Result<DataType> {
     }
 }
 
+/// Replaces top-level string and binary fields with views, preserving nested and extension fields.
+pub fn schema_with_view_types(schema: &ArrowSchema) -> ArrowSchema {
+    let fields = schema.fields().iter().map(|field| {
+        let metadata_column = field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|id| id.parse::<i32>().ok())
+            .is_some_and(is_metadata_field);
+        if metadata_column || field.extension_type_name().is_some() {
+            return Arc::clone(field);
+        }
+        let data_type = match field.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => DataType::Utf8View,
+            DataType::Binary | DataType::LargeBinary => DataType::BinaryView,
+            _ => return Arc::clone(field),
+        };
+        Arc::new(field.as_ref().clone().with_data_type(data_type))
+    });
+    ArrowSchema::new_with_metadata(fields.collect::<Vec<_>>(), schema.metadata().clone())
+}
+
 /// Convert Iceberg Datum to Arrow Datum.
 pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send + Sync>> {
     match (datum.data_type(), datum.literal()) {
@@ -1451,6 +1473,51 @@ mod tests {
             PARQUET_FIELD_ID_META_KEY.to_string(),
             value.to_string(),
         )]))
+    }
+
+    #[test]
+    fn test_schema_with_view_types_preserves_nested_extensions_and_metadata() {
+        let text = simple_field("text", DataType::Utf8, true, "1");
+        let bytes = simple_field("bytes", DataType::LargeBinary, false, "2");
+        let nested = simple_field(
+            "nested",
+            DataType::Struct(vec![simple_field("value", DataType::Utf8, true, "4")].into()),
+            false,
+            "3",
+        );
+        let extension =
+            Field::new("extension", DataType::Binary, true).with_metadata(HashMap::from([(
+                arrow_schema::extension::EXTENSION_TYPE_NAME_KEY.to_owned(),
+                "example.binary".to_owned(),
+            )]));
+        let file = simple_field(
+            "_file",
+            DataType::Utf8,
+            false,
+            &crate::metadata_columns::RESERVED_FIELD_ID_FILE.to_string(),
+        );
+        let metadata = HashMap::from([("source".to_owned(), "fixture".to_owned())]);
+        let schema = ArrowSchema::new_with_metadata(
+            vec![
+                text.clone(),
+                bytes.clone(),
+                nested.clone(),
+                extension.clone(),
+                file.clone(),
+            ],
+            metadata.clone(),
+        );
+        let expected = ArrowSchema::new_with_metadata(
+            vec![
+                text.with_data_type(DataType::Utf8View),
+                bytes.with_data_type(DataType::BinaryView),
+                nested,
+                extension,
+                file,
+            ],
+            metadata,
+        );
+        assert_eq!(schema_with_view_types(&schema), expected);
     }
 
     fn arrow_schema_for_arrow_schema_to_schema_test() -> ArrowSchema {

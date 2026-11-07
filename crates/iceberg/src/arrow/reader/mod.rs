@@ -73,6 +73,7 @@ use projection::{
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
     batch_size: Option<usize>,
+    view_types: bool,
     file_io: FileIO,
     concurrency_limit_data_files: usize,
     row_group_filtering_enabled: bool,
@@ -92,6 +93,7 @@ impl ArrowReaderBuilder {
 
         ArrowReaderBuilder {
             batch_size: None,
+            view_types: false,
             file_io,
             concurrency_limit_data_files: num_cpus,
             row_group_filtering_enabled: true,
@@ -115,6 +117,12 @@ impl ArrowReaderBuilder {
     /// to something other than the default
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Requests top-level Parquet string and binary columns as view arrays.
+    pub fn with_view_types(mut self, view_types: bool) -> Self {
+        self.view_types = view_types;
         self
     }
 
@@ -206,6 +214,7 @@ impl ArrowReaderBuilder {
     pub fn build(self) -> ArrowReader {
         ArrowReader {
             batch_size: self.batch_size,
+            view_types: self.view_types,
             file_io: self.file_io.clone(),
             delete_file_loader: CachingDeleteFileLoader::new(
                 self.file_io.clone(),
@@ -228,6 +237,7 @@ impl ArrowReaderBuilder {
 #[derive(Clone)]
 pub struct ArrowReader {
     batch_size: Option<usize>,
+    view_types: bool,
     file_io: FileIO,
     delete_file_loader: CachingDeleteFileLoader,
 
