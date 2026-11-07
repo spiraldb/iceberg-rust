@@ -62,6 +62,7 @@ pub(super) fn read_in_background(
             if sender.send(batch).await.is_err() || failed {
                 break;
             }
+            tokio::task::yield_now().await;
         }
     };
     let worker = runtime.cpu().spawn(Abortable::new(producer, registration));
