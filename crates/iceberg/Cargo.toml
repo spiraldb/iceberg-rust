@@ -31,7 +31,6 @@ repository = { workspace = true }
 
 [features]
 default = []
-vortex = ["dep:vortex"]
 
 [dependencies]
 aes-gcm = { workspace = true }
@@ -87,7 +86,7 @@ typed-builder = { workspace = true }
 typetag = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
-vortex = { workspace = true, optional = true }
+vortex = { workspace = true }
 zeroize = { workspace = true }
 zstd = { workspace = true }
 

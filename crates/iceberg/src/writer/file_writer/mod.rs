@@ -26,9 +26,7 @@ use crate::spec::DataFileBuilder;
 
 mod parquet_writer;
 pub use parquet_writer::{ParquetWriter, ParquetWriterBuilder};
-#[cfg(feature = "vortex")]
 mod vortex_writer;
-#[cfg(feature = "vortex")]
 pub use vortex_writer::{VortexWriter, VortexWriterBuilder};
 
 use crate::io::OutputFile;

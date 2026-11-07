@@ -107,7 +107,6 @@ impl BasicDeleteFileLoader {
                 )
                 .await
             }
-            #[cfg(feature = "vortex")]
             crate::spec::DataFileFormat::Vortex => {
                 crate::arrow::reader::vortex::vortex_to_batch_stream(
                     task.file_path(),
@@ -174,32 +173,6 @@ mod tests {
     use super::*;
     use crate::arrow::delete_filter::tests::setup;
     use crate::arrow::test_utils::write_encrypted_parquet;
-
-    #[cfg(not(feature = "vortex"))]
-    #[tokio::test]
-    async fn test_vortex_delete_file_requires_feature() {
-        let task = FileScanTaskDeleteFile::builder()
-            .with_file_path("unopened.vortex".to_string())
-            .with_file_size_in_bytes(0)
-            .with_file_type(crate::spec::DataContentType::PositionDeletes)
-            .with_file_format(crate::spec::DataFileFormat::Vortex)
-            .with_partition_spec_id(0)
-            .build()
-            .unwrap();
-        let loader = BasicDeleteFileLoader::new(FileIO::new_with_fs(), ScanMetrics::new());
-        let error = match loader.to_batch_stream(&task).await {
-            Ok(_) => panic!("Vortex delete file accepted without the feature"),
-            Err(error) => error,
-        };
-
-        assert_eq!(
-            (error.kind(), error.message()),
-            (
-                ErrorKind::FeatureUnsupported,
-                "Unsupported delete file format: vortex"
-            )
-        );
-    }
 
     #[tokio::test]
     async fn test_basic_delete_file_loader_read_delete_file() {
