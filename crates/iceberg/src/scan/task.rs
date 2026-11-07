@@ -168,6 +168,25 @@ impl FileScanTask {
         self.length
     }
 
+    /// Restricts the task to a byte range within its data file.
+    pub fn with_byte_range(mut self, start: u64, length: u64) -> Result<Self> {
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| invalid_data!("File scan byte range overflows u64"))?;
+        if end > self.file_size_in_bytes || (length == 0 && self.file_size_in_bytes != 0) {
+            return Err(invalid_data!(
+                "Invalid file scan byte range {start}..{end} for file size {}",
+                self.file_size_in_bytes
+            ));
+        }
+        self.start = start;
+        self.length = length;
+        if start != 0 || length != self.file_size_in_bytes {
+            self.record_count = None;
+        }
+        Ok(self)
+    }
+
     /// Returns the number of records in the file when the whole file is scanned.
     pub fn record_count(&self) -> Option<u64> {
         self.record_count
@@ -788,6 +807,31 @@ mod tests {
             .with_partition_spec(partition_spec)
             .with_case_sensitive(false)
             .build()
+    }
+
+    #[test]
+    fn test_file_scan_task_byte_range() {
+        let mut task =
+            build_file_scan_task(Arc::new(Schema::builder().build().unwrap()), None, None).unwrap();
+        task.record_count = Some(10);
+
+        assert_eq!(task.clone().with_byte_range(0, 100).unwrap(), task);
+
+        let mut expected = task.clone();
+        expected.start = 25;
+        expected.length = 50;
+        expected.record_count = None;
+        assert_eq!(task.clone().with_byte_range(25, 50).unwrap(), expected);
+
+        for (start, length) in [(0, 101), (101, 1), (25, 0), (u64::MAX, 2)] {
+            assert_eq!(
+                task.clone()
+                    .with_byte_range(start, length)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::DataInvalid
+            );
+        }
     }
 
     fn schema_and_spec(

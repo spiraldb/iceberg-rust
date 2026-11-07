@@ -1378,6 +1378,7 @@ pub fn iceberg::scan::FileScanTask::sort_order(&self) -> core::option::Option<&i
 pub fn iceberg::scan::FileScanTask::sort_order_id(&self) -> core::option::Option<i32>
 pub fn iceberg::scan::FileScanTask::start(&self) -> u64
 pub fn iceberg::scan::FileScanTask::unified_partition_type(&self) -> core::option::Option<&alloc::sync::Arc<iceberg::spec::StructType>>
+pub fn iceberg::scan::FileScanTask::with_byte_range(self, start: u64, length: u64) -> iceberg::Result<Self>
 impl core::clone::Clone for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::clone(&self) -> iceberg::scan::FileScanTask
 impl core::cmp::PartialEq for iceberg::scan::FileScanTask
