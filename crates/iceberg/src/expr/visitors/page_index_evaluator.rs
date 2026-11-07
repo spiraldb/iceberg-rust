@@ -316,18 +316,8 @@ impl<'a> PageIndexEvaluator<'a> {
                 .zip(row_counts.iter())
                 .map(|((i, (min, max)), &row_count)| {
                     predicate(
-                        min.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Float(OrderedFloat::from(val)),
-                            )
-                        }),
-                        max.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Float(OrderedFloat::from(val)),
-                            )
-                        }),
+                        min.map(|&val| Self::float_bound_to_datum(field_type, val)),
+                        max.map(|&val| Self::float_bound_to_datum(field_type, val)),
                         PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
                     )
                 })
@@ -495,6 +485,7 @@ impl<'a> PageIndexEvaluator<'a> {
     /// primitive type.
     fn int32_bound_to_datum(field_type: &PrimitiveType, val: i32) -> Datum {
         match field_type {
+            PrimitiveType::Long => Datum::long(val),
             PrimitiveType::Decimal { .. } => Datum::new(
                 field_type.clone(),
                 PrimitiveLiteral::Int128(i128::from(val)),
@@ -512,6 +503,16 @@ impl<'a> PageIndexEvaluator<'a> {
                 PrimitiveLiteral::Int128(i128::from(val)),
             ),
             _ => Datum::new(field_type.clone(), PrimitiveLiteral::Long(val)),
+        }
+    }
+
+    fn float_bound_to_datum(field_type: &PrimitiveType, val: f32) -> Datum {
+        match field_type {
+            PrimitiveType::Double => Datum::double(f64::from(val)),
+            _ => Datum::new(
+                field_type.clone(),
+                PrimitiveLiteral::Float(OrderedFloat::from(val)),
+            ),
         }
     }
 
@@ -973,8 +974,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float32Array, LargeBinaryArray,
-        RecordBatch, StringArray,
+        ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float32Array, Int32Array,
+        LargeBinaryArray, RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::ArrowWriter;
@@ -982,7 +983,7 @@ mod tests {
         ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelector,
     };
     use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
-    use parquet::file::properties::WriterProperties;
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use rand::Rng;
     use tempfile::NamedTempFile;
 
@@ -1304,6 +1305,233 @@ mod tests {
         let column_index = metadata.column_index().unwrap()[0].to_vec();
         let offset_index = metadata.offset_index().unwrap()[0].to_vec();
         (column_index, offset_index, row_group_metadata)
+    }
+
+    fn create_primitive_parquet_pages(
+        pages: Vec<ArrayRef>,
+    ) -> Result<(Arc<ParquetMetaData>, NamedTempFile)> {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "col",
+            pages[0].data_type().clone(),
+            true,
+        )]));
+        let temp_file = NamedTempFile::new().unwrap();
+        let properties = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_data_page_row_count_limit(128)
+            .set_write_batch_size(128)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            temp_file.reopen().unwrap(),
+            schema.clone(),
+            Some(properties),
+        )
+        .unwrap();
+        for page in pages {
+            let batch = RecordBatch::try_new(schema.clone(), vec![page]).unwrap();
+            for row in 0..batch.num_rows() {
+                writer.write(&batch.slice(row, 1)).unwrap();
+            }
+        }
+        writer.close().unwrap();
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
+        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            temp_file.reopen().unwrap(),
+            options,
+        )
+        .unwrap();
+        Ok((reader.metadata().clone(), temp_file))
+    }
+
+    #[test]
+    fn eval_promoted_int32_page_bounds_as_long() -> Result<()> {
+        let pages = [Some(i32::MIN), Some(-1), None, Some(0), Some(i32::MAX)]
+            .into_iter()
+            .map(|value| Arc::new(Int32Array::from(vec![value; 128])) as ArrayRef)
+            .collect();
+        let (metadata, _file) = create_primitive_parquet_pages(pages)?;
+        let (column_index, offset_index, row_group) = get_test_metadata(&metadata);
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields([Arc::new(NestedField::new(
+                    1,
+                    "col",
+                    PrimitiveType::Long.into(),
+                    false,
+                ))])
+                .build()?,
+        );
+        let field_ids = HashMap::from([(1, 0)]);
+        let col = Reference::new("col");
+        let non_null = vec![
+            RowSelector::select(256),
+            RowSelector::skip(128),
+            RowSelector::select(256),
+        ];
+        for (predicate, expected) in [
+            (
+                col.clone().less_than(Datum::long(2147483648_i64)),
+                non_null.clone(),
+            ),
+            (
+                col.clone().less_than_or_equal_to(Datum::long(i32::MAX)),
+                non_null.clone(),
+            ),
+            (col.clone().less_than(Datum::long(i32::MAX)), vec![
+                RowSelector::select(256),
+                RowSelector::skip(128),
+                RowSelector::select(128),
+                RowSelector::skip(128),
+            ]),
+            (
+                col.clone().greater_than_or_equal_to(Datum::long(i32::MAX)),
+                vec![RowSelector::skip(512), RowSelector::select(128)],
+            ),
+            (col.clone().greater_than(Datum::long(i32::MAX)), vec![
+                RowSelector::skip(640),
+            ]),
+            (
+                col.clone().greater_than(Datum::long(-2147483649_i64)),
+                non_null.clone(),
+            ),
+            (
+                col.clone().greater_than_or_equal_to(Datum::long(i32::MIN)),
+                non_null,
+            ),
+            (col.clone().less_than(Datum::long(i32::MIN)), vec![
+                RowSelector::skip(640),
+            ]),
+            (
+                col.clone().less_than_or_equal_to(Datum::long(i32::MIN)),
+                vec![RowSelector::select(128), RowSelector::skip(512)],
+            ),
+            (col.greater_than(Datum::long(i32::MIN)), vec![
+                RowSelector::skip(128),
+                RowSelector::select(128),
+                RowSelector::skip(128),
+                RowSelector::select(256),
+            ]),
+        ] {
+            let bound = predicate.bind(schema.clone(), false)?;
+            let actual = PageIndexEvaluator::eval(
+                &bound,
+                &column_index,
+                &offset_index,
+                row_group,
+                &field_ids,
+                &schema,
+            )?;
+            assert_eq!(actual, expected, "predicate: {bound:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn eval_promoted_float_page_bounds_as_double() -> Result<()> {
+        let pages = [
+            Some(-16777216.0_f32),
+            Some(0.0),
+            None,
+            Some(16777216.0),
+            Some(16777218.0),
+        ]
+        .into_iter()
+        .map(|value| Arc::new(Float32Array::from(vec![value; 128])) as ArrayRef)
+        .collect();
+        let (metadata, _file) = create_primitive_parquet_pages(pages)?;
+        let (column_index, offset_index, row_group) = get_test_metadata(&metadata);
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields([Arc::new(NestedField::new(
+                    1,
+                    "col",
+                    PrimitiveType::Double.into(),
+                    false,
+                ))])
+                .build()?,
+        );
+        let field_ids = HashMap::from([(1, 0)]);
+        let col = Reference::new("col");
+        for (predicate, expected) in [
+            (col.clone().less_than(Datum::double(16777217.0)), vec![
+                RowSelector::select(256),
+                RowSelector::skip(128),
+                RowSelector::select(128),
+                RowSelector::skip(128),
+            ]),
+            (
+                col.clone().less_than_or_equal_to(Datum::double(16777216.0)),
+                vec![
+                    RowSelector::select(256),
+                    RowSelector::skip(128),
+                    RowSelector::select(128),
+                    RowSelector::skip(128),
+                ],
+            ),
+            (col.clone().greater_than(Datum::double(16777217.0)), vec![
+                RowSelector::skip(512),
+                RowSelector::select(128),
+            ]),
+            (
+                col.clone()
+                    .greater_than_or_equal_to(Datum::double(16777218.0)),
+                vec![RowSelector::skip(512), RowSelector::select(128)],
+            ),
+            (
+                col.clone()
+                    .greater_than_or_equal_to(Datum::double(16777216.0)),
+                vec![RowSelector::skip(384), RowSelector::select(256)],
+            ),
+            (col.clone().greater_than(Datum::double(16777216.0)), vec![
+                RowSelector::skip(512),
+                RowSelector::select(128),
+            ]),
+            (col.clone().less_than(Datum::double(-16777216.0)), vec![
+                RowSelector::skip(640),
+            ]),
+            (col.less_than_or_equal_to(Datum::double(-16777216.0)), vec![
+                RowSelector::select(128),
+                RowSelector::skip(512),
+            ]),
+        ] {
+            let bound = predicate.bind(schema.clone(), false)?;
+            let actual = PageIndexEvaluator::eval(
+                &bound,
+                &column_index,
+                &offset_index,
+                row_group,
+                &field_ids,
+                &schema,
+            )?;
+            assert_eq!(actual, expected, "predicate: {bound:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn eval_promoted_decimal_page_bounds_preserve_precision() -> Result<()> {
+        for precision in [9, 18] {
+            let (metadata, _file) = create_decimal_parquet_file(precision, 2, &[-400, 100, 300])?;
+            let (column_index, offset_index, row_group) = get_test_metadata(&metadata);
+            let (schema, field_ids) = build_decimal_schema_and_field_map(30, 2)?;
+            let bound = Reference::new("col_decimal")
+                .greater_than(decimal_datum(150, 2, 30)?)
+                .bind(schema.clone(), false)?;
+            let actual = PageIndexEvaluator::eval(
+                &bound,
+                &column_index,
+                &offset_index,
+                row_group,
+                &field_ids,
+                &schema,
+            )?;
+            assert_eq!(actual, vec![
+                RowSelector::skip(2048),
+                RowSelector::select(1024)
+            ]);
+        }
+        Ok(())
     }
 
     #[test]
