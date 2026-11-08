@@ -781,7 +781,7 @@ fn datum_to_vortex_scalar(datum: &Datum, file_dtype: &DType) -> Result<Scalar> {
                     format!("Cannot compare UUID to Vortex column of type {file_dtype}"),
                 ));
             };
-            if !ext.is::<vortex::extension::uuid::Uuid>() {
+            if !ext.is::<vortex::encodings::uuid::Uuid>() {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
                     format!("Cannot compare UUID to Vortex extension {ext}"),
@@ -2125,10 +2125,14 @@ mod tests {
         let file = write_batch_file(&path, &io, schema.clone(), &batch).await;
         assert_eq!(file.null_value_counts().get(&1), Some(&1));
         assert!(!file.null_value_counts().contains_key(&3));
-        for id in [1, 3] {
-            assert!(!file.lower_bounds().contains_key(&id));
-            assert!(!file.upper_bounds().contains_key(&id));
-        }
+        assert_eq!(
+            file.lower_bounds(),
+            &std::collections::HashMap::from([(1, Datum::uuid(uuids[0]))])
+        );
+        assert_eq!(
+            file.upper_bounds(),
+            &std::collections::HashMap::from([(1, Datum::uuid(uuids[1]))])
+        );
         let session = VortexSession::default();
         let (opened, _) = super::open_vortex_file(
             &path,
