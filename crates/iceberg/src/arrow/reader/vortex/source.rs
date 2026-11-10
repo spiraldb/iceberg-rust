@@ -18,6 +18,7 @@
 mod cache;
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
@@ -30,9 +31,9 @@ use futures::{StreamExt, stream};
 use vortex::array::stats::StatsSet;
 use vortex::array::stream::{ArrayStreamAdapter, SendableArrayStream};
 use vortex::arrow::ArrowSessionExt;
-use vortex::dtype::{DType, FieldPath, Nullability};
+use vortex::dtype::{DType, Field, FieldPath, Nullability};
 use vortex::error::{VortexResult, vortex_bail};
-use vortex::expr::stats::Precision;
+use vortex::expr::stats::{Precision, Stat};
 use vortex::expr::transform::replace;
 use vortex::expr::{BoundExpression, Expression, and_collect, cast, get_item, lit, pack, root};
 use vortex::scalar::Scalar;
@@ -43,13 +44,13 @@ use vortex::scan::{
 };
 use vortex::session::VortexSession;
 
-use super::{byte_range_to_rows, convert_predicate_to_vortex};
+use super::{byte_range_to_rows, convert_predicate_to_vortex, datum_to_vortex_scalar};
 use crate::arrow::vortex_util::VORTEX_SCHEMA_KEY;
 use crate::arrow::{schema_to_arrow_schema, to_iceberg_error};
 use crate::io::FileIO;
 use crate::metadata_columns::is_metadata_field;
 use crate::scan::FileScanTask;
-use crate::spec::{DataFileFormat, PrimitiveType, Schema, SchemaRef, Type};
+use crate::spec::{DataFileFormat, Datum, PrimitiveType, Schema, SchemaRef, Type};
 use crate::{Result, Runtime};
 
 /// Scans supported Iceberg Vortex tasks into Vortex arrays.
@@ -58,6 +59,7 @@ use crate::{Result, Runtime};
 /// Partition ranges and selections address this source's stable partition indices.
 pub struct VortexScanSource {
     dtype: DType,
+    statistics: HashMap<String, StatsSet>,
     tasks: Vec<Arc<PreparedTask>>,
     bytes_read: Arc<AtomicU64>,
 }
@@ -112,6 +114,7 @@ impl VortexScanSource {
         let Some(dtype) = array_source_dtype(&schema, session) else {
             return Ok(None);
         };
+        let statistics = manifest_statistics(&schema, &dtype, &tasks);
         let bytes_read = Arc::clone(cache.bytes_read_counter());
         let mut prepared = Vec::with_capacity(tasks.len());
         // A partially supported snapshot must never yield rows before the caller falls back.
@@ -195,6 +198,7 @@ impl VortexScanSource {
             .collect();
         Ok(Some(Self {
             dtype,
+            statistics,
             tasks,
             bytes_read,
         }))
@@ -215,6 +219,78 @@ struct PreparedTask {
     predicate: Option<Expression>,
     rows: Range<u64>,
     bytes: u64,
+}
+
+/// Whole-file bounds remain inclusive bounds for filtered or byte-range tasks,
+/// but their extrema need not occur in the selected rows. Do not fabricate NDVs
+/// or counts, and discard a column's bounds if any nonempty task lacks them.
+fn manifest_statistics(
+    schema: &Schema,
+    dtype: &DType,
+    tasks: &[FileScanTask],
+) -> HashMap<String, StatsSet> {
+    let Some(fields) = dtype.as_struct_fields_opt() else {
+        return HashMap::new();
+    };
+    schema
+        .as_struct()
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            // Float bounds exclude NaNs in Iceberg. Do not reinterpret them as
+            // bounds for Vortex ordering without a complete NaN-count proof.
+            if !matches!(
+                field.field_type.as_ref(),
+                Type::Primitive(PrimitiveType::Int | PrimitiveType::Long)
+            ) {
+                return None;
+            }
+            let target = fields.field(&field.name)?;
+            let bound = |datum: &Datum| -> Option<Scalar> {
+                if !safe_promotion(
+                    &Type::Primitive(datum.data_type().clone()),
+                    field.field_type.as_ref(),
+                ) {
+                    return None;
+                }
+                datum_to_vortex_scalar(datum, &target)
+                    .ok()?
+                    .cast(&target)
+                    .ok()
+            };
+            let mut range: Option<(Scalar, Scalar)> = None;
+            for task in tasks.iter().filter(|task| task.record_count() != Some(0)) {
+                let lower = bound(task.lower_bounds().get(&field.id)?)?;
+                let upper = bound(task.upper_bounds().get(&field.id)?)?;
+                if lower.partial_cmp(&upper)?.is_gt() {
+                    return None;
+                }
+                range = Some(match range {
+                    Some((minimum, maximum)) => (
+                        if lower.partial_cmp(&minimum)?.is_lt() {
+                            lower
+                        } else {
+                            minimum
+                        },
+                        if upper.partial_cmp(&maximum)?.is_gt() {
+                            upper
+                        } else {
+                            maximum
+                        },
+                    ),
+                    None => (lower, upper),
+                });
+            }
+            let (lower, upper) = range?;
+            let stats = [
+                (Stat::Min, Precision::Inexact(lower.into_value()?)),
+                (Stat::Max, Precision::Inexact(upper.into_value()?)),
+            ]
+            .into_iter()
+            .collect();
+            Some((field.name.clone(), stats))
+        })
+        .collect()
 }
 
 fn array_source_dtype(schema: &Schema, session: &VortexSession) -> Option<DType> {
@@ -241,8 +317,15 @@ impl DataSource for VortexScanSource {
         }
     }
 
-    async fn field_statistics(&self, _field: &FieldPath) -> VortexResult<StatsSet> {
-        Ok(StatsSet::default())
+    async fn field_statistics(&self, field: &FieldPath) -> VortexResult<StatsSet> {
+        let [Field::Name(name)] = field.parts() else {
+            return Ok(StatsSet::default());
+        };
+        Ok(self
+            .statistics
+            .get(name.as_ref())
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn scan(&self, request: ScanRequest) -> VortexResult<DataSourceScanRef> {

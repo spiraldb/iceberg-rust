@@ -3692,6 +3692,7 @@ pub fn iceberg::writer::file_writer::ParquetWriterBuilder::fmt(&self, f: &mut co
 impl iceberg::writer::file_writer::FileWriterBuilder for iceberg::writer::file_writer::ParquetWriterBuilder
 pub type iceberg::writer::file_writer::ParquetWriterBuilder::R = iceberg::writer::file_writer::ParquetWriter
 pub async fn iceberg::writer::file_writer::ParquetWriterBuilder::build(&self, output_file: iceberg::io::OutputFile) -> iceberg::Result<Self::R>
+pub fn iceberg::writer::file_writer::vortex_data_file_builder(file_path: alloc::string::String, file_size_in_bytes: u64, schema: &iceberg::spec::Schema, footer: &vortex_file::footer::Footer) -> iceberg::Result<iceberg::spec::DataFileBuilder>
 pub struct iceberg::writer::file_writer::VortexWriter
 impl iceberg::writer::CurrentFileStatus for iceberg::writer::file_writer::VortexWriter
 pub fn iceberg::writer::file_writer::VortexWriter::current_file_path(&self) -> alloc::string::String

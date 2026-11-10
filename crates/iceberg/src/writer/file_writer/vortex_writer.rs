@@ -34,7 +34,7 @@ use vortex::dtype::extension::Matcher;
 use vortex::dtype::{DType, FieldPath, PType};
 use vortex::expr::stats::{Stat, StatsProvider, StatsProviderExt};
 use vortex::extension::datetime::{AnyTemporal, TimeUnit};
-use vortex::file::{WriteOptionsSessionExt, WriteStrategyBuilder, WriteSummary};
+use vortex::file::{Footer, WriteOptionsSessionExt, WriteStrategyBuilder, WriteSummary};
 use vortex::io::{IoBuf, VortexWrite};
 use vortex::layout::BufferedBytesTracker;
 use vortex::scalar::Scalar;
@@ -45,7 +45,7 @@ use crate::arrow::{convert_temporal_value, to_iceberg_error};
 use crate::io::{FileWrite, OutputFile};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, PrimitiveLiteral, PrimitiveType,
-    SchemaRef, Struct, Type,
+    Schema, SchemaRef, Struct, Type,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -125,7 +125,6 @@ pub struct VortexWriter {
 /// finished. The channel is bounded so the task applies backpressure instead
 /// of buffering batches.
 struct StreamingWriter {
-    arrow_schema: ArrowSchemaRef,
     batches: mpsc::Sender<ArrayRef>,
     task: tokio::task::JoinHandle<Result<WriteSummary>>,
     bytes_written: Arc<AtomicU64>,
@@ -187,115 +186,126 @@ impl VortexWriter {
         });
 
         Ok(StreamingWriter {
-            arrow_schema,
             batches,
             task,
             bytes_written,
             buffered_bytes,
         })
     }
+}
 
-    fn data_file_builder(
-        &self,
-        summary: &WriteSummary,
-        arrow_schema: &ArrowSchemaRef,
-    ) -> Result<DataFileBuilder> {
-        let record_count = summary.row_count();
+/// Build an Iceberg data-file descriptor from a Vortex footer without reading payloads.
+///
+/// `schema` is the file's logical Iceberg schema, with matching physical field
+/// names/types and correct stable field IDs, rather than an arbitrary evolved
+/// table schema. Footer names alone cannot authenticate field IDs. The caller supplies the path, size, partition values and partition spec ID. Available
+/// top-level counts and bounds use the same conversion rules as the Vortex writer;
+/// absent or unsupported statistics remain absent. Encoded file data is unchanged.
+pub fn vortex_data_file_builder(
+    file_path: String,
+    file_size_in_bytes: u64,
+    schema: &Schema,
+    footer: &Footer,
+) -> Result<DataFileBuilder> {
+    let record_count = footer.row_count();
 
-        // Use Vortex's top-level footer statistics. Nested value counts and
-        // bounds remain unimplemented until Vortex provides them.
-        let mut value_counts: HashMap<i32, u64> = HashMap::new();
-        let mut null_value_counts: HashMap<i32, u64> = HashMap::new();
-        let mut nan_value_counts: HashMap<i32, u64> = HashMap::new();
-        let mut lower_bounds: HashMap<i32, Datum> = HashMap::new();
-        let mut upper_bounds: HashMap<i32, Datum> = HashMap::new();
-        let file_stats = summary.footer().statistics();
-        for field in arrow_schema.fields() {
-            let Some(iceberg_field) = self.schema.field_by_name(field.name()) else {
-                continue;
-            };
-            let primitive_type = match iceberg_field.field_type.as_ref() {
-                Type::Primitive(primitive_type) => Some(primitive_type),
-                Type::Variant(_) => None,
-                _ => continue,
-            };
-            // Top-level columns hold exactly one value per row.
-            value_counts.insert(iceberg_field.id, record_count);
-            let Some((stats, field_dtype)) = file_stats
-                .and_then(|stats| stats.get_by_path(&FieldPath::from_name(field.name().as_str())))
-            else {
-                continue;
-            };
-            let stats_set = stats.to_stats_set();
-            let typed_stats = stats_set.as_typed_ref(field_dtype);
-            if let Some(null_count) = typed_stats.get_as::<u64>(Stat::NullCount).as_exact() {
-                null_value_counts.insert(iceberg_field.id, null_count);
+    // Use Vortex's top-level footer statistics. Nested value counts and
+    // bounds remain unimplemented until Vortex provides them.
+    let mut value_counts: HashMap<i32, u64> = HashMap::new();
+    let mut null_value_counts: HashMap<i32, u64> = HashMap::new();
+    let mut nan_value_counts: HashMap<i32, u64> = HashMap::new();
+    let mut lower_bounds: HashMap<i32, Datum> = HashMap::new();
+    let mut upper_bounds: HashMap<i32, Datum> = HashMap::new();
+    let file_stats = footer.statistics();
+    let fields = footer.dtype().as_struct_fields_opt().ok_or_else(|| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "An Iceberg Vortex data file must contain a struct",
+        )
+    })?;
+    for name in fields.names().iter() {
+        let name: &str = name.as_ref();
+        let Some(iceberg_field) = schema.as_struct().field_by_name(name) else {
+            continue;
+        };
+        let primitive_type = match iceberg_field.field_type.as_ref() {
+            Type::Primitive(primitive_type) => Some(primitive_type),
+            Type::Variant(_) => None,
+            _ => continue,
+        };
+        // Top-level columns hold exactly one value per row.
+        value_counts.insert(iceberg_field.id, record_count);
+        let Some((stats, field_dtype)) =
+            file_stats.and_then(|stats| stats.get_by_path(&FieldPath::from_name(name)))
+        else {
+            continue;
+        };
+        let stats_set = stats.to_stats_set();
+        let typed_stats = stats_set.as_typed_ref(field_dtype);
+        if let Some(null_count) = typed_stats.get_as::<u64>(Stat::NullCount).as_exact() {
+            null_value_counts.insert(iceberg_field.id, null_count);
+        }
+        if matches!(
+            primitive_type,
+            Some(PrimitiveType::Float | PrimitiveType::Double)
+        ) && let Some(nan_count) = typed_stats.get_as::<u64>(Stat::NaNCount).as_exact()
+        {
+            nan_value_counts.insert(iceberg_field.id, nan_count);
+        }
+        if let Some(primitive_type) = primitive_type {
+            if let Some(min) = stat_bound(&typed_stats, Stat::Min, primitive_type) {
+                lower_bounds.insert(iceberg_field.id, min);
             }
-            if matches!(
-                primitive_type,
-                Some(PrimitiveType::Float | PrimitiveType::Double)
-            ) && let Some(nan_count) = typed_stats.get_as::<u64>(Stat::NaNCount).as_exact()
-            {
-                nan_value_counts.insert(iceberg_field.id, nan_count);
-            }
-            if let Some(primitive_type) = primitive_type {
-                if let Some(min) = stat_bound(&typed_stats, Stat::Min, primitive_type) {
-                    lower_bounds.insert(iceberg_field.id, min);
-                }
-                if let Some(max) = stat_bound(&typed_stats, Stat::Max, primitive_type) {
-                    upper_bounds.insert(iceberg_field.id, max);
-                }
+            if let Some(max) = stat_bound(&typed_stats, Stat::Max, primitive_type) {
+                upper_bounds.insert(iceberg_field.id, max);
             }
         }
+    }
 
-        let sizes = summary
-            .footer()
-            .compressed_field_sizes()
-            .map_err(to_iceberg_error)?;
-        let mut column_sizes = HashMap::new();
-        fn collect_sizes(
-            fields: &[crate::spec::NestedFieldRef],
-            path: FieldPath,
-            sizes: &vortex::file::CompressedFieldSizes,
-            output: &mut HashMap<i32, u64>,
-        ) {
-            for field in fields {
-                let path = path.clone().push(field.name.as_str());
-                match field.field_type.as_ref() {
-                    Type::Struct(children) => collect_sizes(children.fields(), path, sizes, output),
-                    _ => {
-                        if let Some(size) = sizes.get(&path) {
-                            output.insert(field.id, size);
-                        }
+    let sizes = footer.compressed_field_sizes().map_err(to_iceberg_error)?;
+    let mut column_sizes = HashMap::new();
+    fn collect_sizes(
+        fields: &[crate::spec::NestedFieldRef],
+        path: FieldPath,
+        sizes: &vortex::file::CompressedFieldSizes,
+        output: &mut HashMap<i32, u64>,
+    ) {
+        for field in fields {
+            let path = path.clone().push(field.name.as_str());
+            match field.field_type.as_ref() {
+                Type::Struct(children) => collect_sizes(children.fields(), path, sizes, output),
+                _ => {
+                    if let Some(size) = sizes.get(&path) {
+                        output.insert(field.id, size);
                     }
                 }
             }
         }
-        collect_sizes(
-            self.schema.as_struct().fields(),
-            FieldPath::root(),
-            &sizes,
-            &mut column_sizes,
-        );
-        let mut builder = DataFileBuilder::default();
-        builder
-            .content(DataContentType::Data)
-            .file_path(self.output_file.location().to_string())
-            .file_format(DataFileFormat::Vortex)
-            .partition(Struct::empty())
-            .record_count(record_count)
-            .file_size_in_bytes(summary.size())
-            .column_sizes(column_sizes)
-            .value_counts(value_counts)
-            .null_value_counts(null_value_counts)
-            .nan_value_counts(nan_value_counts)
-            .lower_bounds(lower_bounds)
-            .upper_bounds(upper_bounds);
-        // Vortex files can be split at arbitrary row offsets, so no physical
-        // split offsets are recorded.
-
-        Ok(builder)
     }
+    collect_sizes(
+        schema.as_struct().fields(),
+        FieldPath::root(),
+        &sizes,
+        &mut column_sizes,
+    );
+    let mut builder = DataFileBuilder::default();
+    builder
+        .content(DataContentType::Data)
+        .file_path(file_path)
+        .file_format(DataFileFormat::Vortex)
+        .partition(Struct::empty())
+        .record_count(record_count)
+        .file_size_in_bytes(file_size_in_bytes)
+        .column_sizes(column_sizes)
+        .value_counts(value_counts)
+        .null_value_counts(null_value_counts)
+        .nan_value_counts(nan_value_counts)
+        .lower_bounds(lower_bounds)
+        .upper_bounds(upper_bounds);
+    // Vortex files can be split at arbitrary row offsets, so no physical
+    // split offsets are recorded.
+
+    Ok(builder)
 }
 
 /// Converts a min/max statistic into an iceberg bound [`Datum`].
@@ -320,16 +330,23 @@ fn stat_bound(
 fn vortex_scalar_to_datum(scalar: Scalar, primitive_type: &PrimitiveType) -> Option<Datum> {
     match primitive_type {
         PrimitiveType::Boolean => Some(Datum::bool(scalar.as_bool_opt()?.value()?)),
-        PrimitiveType::Int => Some(Datum::int(scalar.as_primitive_opt()?.typed_value::<i32>()?)),
-        PrimitiveType::Long => Some(Datum::long(
-            scalar.as_primitive_opt()?.typed_value::<i64>()?,
-        )),
+        PrimitiveType::Int | PrimitiveType::Long => {
+            let value = scalar.as_primitive_opt()?;
+            if !value.ptype().is_int() {
+                return None;
+            }
+            let value = value.pvalue()?;
+            Some(match primitive_type {
+                PrimitiveType::Int => Datum::int(value.cast::<i32>().ok()?),
+                _ => Datum::long(value.cast::<i64>().ok()?),
+            })
+        }
         PrimitiveType::Float => {
-            let value = scalar.as_primitive_opt()?.typed_value::<f32>()?;
+            let value = scalar.as_primitive_opt()?.try_typed_value::<f32>().ok()??;
             (!value.is_nan()).then(|| Datum::float(value))
         }
         PrimitiveType::Double => {
-            let value = scalar.as_primitive_opt()?.typed_value::<f64>()?;
+            let value = scalar.as_primitive_opt()?.try_typed_value::<f64>().ok()??;
             (!value.is_nan()).then(|| Datum::double(value))
         }
         PrimitiveType::Date => {
@@ -375,7 +392,7 @@ fn vortex_scalar_to_datum(scalar: Scalar, primitive_type: &PrimitiveType) -> Opt
             let elements = storage.as_list_opt()?.elements()?;
             let bytes = elements
                 .iter()
-                .map(|v| v.as_primitive_opt()?.typed_value::<u8>())
+                .map(|v| v.as_primitive_opt()?.try_typed_value::<u8>().ok()?)
                 .collect::<Option<Vec<_>>>()?;
             Some(Datum::uuid(uuid::Uuid::from_slice(&bytes).ok()?))
         }
@@ -491,19 +508,19 @@ impl FileWriter for VortexWriter {
             return Ok(vec![]);
         };
 
-        let StreamingWriter {
-            arrow_schema,
-            batches,
-            task,
-            ..
-        } = inner;
+        let StreamingWriter { batches, task, .. } = inner;
         // Close the input channel to signal end-of-stream to the write task.
         drop(batches);
         let summary = task.await.map_err(|err| {
             Error::new(ErrorKind::Unexpected, "Vortex write task panicked").with_source(err)
         })??;
 
-        Ok(vec![self.data_file_builder(&summary, &arrow_schema)?])
+        Ok(vec![vortex_data_file_builder(
+            self.output_file.location().to_string(),
+            summary.size(),
+            &self.schema,
+            summary.footer(),
+        )?])
     }
 }
 
