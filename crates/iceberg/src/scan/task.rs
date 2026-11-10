@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
@@ -24,7 +25,7 @@ use typed_builder::TypedBuilder;
 use crate::error::invalid_data;
 use crate::expr::BoundPredicate;
 use crate::spec::{
-    DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
+    DataContentType, DataFileFormat, Datum, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
     SchemaRef, SortOrderRef, Struct, StructType,
 };
 use crate::{Error, Result};
@@ -53,6 +54,11 @@ pub struct FileScanTask {
     /// reading the entire data file.
     #[builder(default)]
     record_count: Option<u64>,
+
+    #[builder(default)]
+    lower_bounds: Arc<HashMap<i32, Datum>>,
+    #[builder(default)]
+    upper_bounds: Arc<HashMap<i32, Datum>>,
 
     /// The first row id assigned to the data file.
     ///
@@ -205,6 +211,20 @@ impl FileScanTask {
     /// Returns the data file path of this file scan task.
     pub fn data_file_path(&self) -> &str {
         &self.data_file_path
+    }
+
+    /// Returns inclusive whole-file lower bounds by field ID.
+    ///
+    /// Bounds also cover rows removed by byte ranges, predicates, or deletes.
+    pub fn lower_bounds(&self) -> &HashMap<i32, Datum> {
+        &self.lower_bounds
+    }
+
+    /// Returns inclusive whole-file upper bounds by field ID.
+    ///
+    /// Bounds also cover rows removed by byte ranges, predicates, or deletes.
+    pub fn upper_bounds(&self) -> &HashMap<i32, Datum> {
+        &self.upper_bounds
     }
 
     /// Returns the format of the data file.
@@ -449,18 +469,56 @@ pub struct FileScanTaskDeleteFile {
 }
 
 mod _serde {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use serde::{Deserialize, Serialize};
+    use serde::ser::SerializeMap as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     use super::{FileScanTask, FileScanTaskDeleteFile};
     use crate::error::invalid_data;
     use crate::expr::BoundPredicate;
     use crate::spec::{
-        DataContentType, DataFileFormat, Literal, NameMapping, PartitionSpec, RawLiteral,
-        SchemaRef, SortOrderRef, StructType, Type,
+        DataContentType, DataFileFormat, Datum, Literal, NameMapping, PartitionSpec, PrimitiveType,
+        RawLiteral, SchemaRef, SortOrderRef, StructType, Type,
     };
     use crate::{Error, Result};
+
+    // JSON numbers cannot preserve nonfinite floating-point file bounds.
+    #[derive(Serialize, Deserialize)]
+    struct FileBound {
+        data_type: PrimitiveType,
+        bytes: Vec<u8>,
+    }
+
+    fn serialize_bounds<S: Serializer>(
+        bounds: &HashMap<i32, Datum>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let mut output = serializer.serialize_map(Some(bounds.len()))?;
+        for (id, bound) in bounds {
+            let bytes = bound.to_bytes().map_err(serde::ser::Error::custom)?;
+            output.serialize_entry(id, &FileBound {
+                data_type: bound.data_type().clone(),
+                bytes: bytes.into_vec(),
+            })?;
+        }
+        output.end()
+    }
+
+    fn deserialize_bounds<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Arc<HashMap<i32, Datum>>, D::Error> {
+        HashMap::<i32, FileBound>::deserialize(deserializer)?
+            .into_iter()
+            .map(|(id, bound)| {
+                Datum::try_from_bytes(&bound.bytes, bound.data_type)
+                    .map(|datum| (id, datum))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect::<std::result::Result<HashMap<_, _>, _>>()
+            .map(Arc::new)
+    }
 
     #[derive(Deserialize)]
     pub(super) struct FileScanTaskSerde {
@@ -468,6 +526,10 @@ mod _serde {
         start: u64,
         length: u64,
         record_count: Option<u64>,
+        #[serde(default, deserialize_with = "deserialize_bounds")]
+        lower_bounds: Arc<HashMap<i32, Datum>>,
+        #[serde(default, deserialize_with = "deserialize_bounds")]
+        upper_bounds: Arc<HashMap<i32, Datum>>,
         first_row_id: Option<i64>,
         data_sequence_number: Option<i64>,
         data_file_path: String,
@@ -500,6 +562,16 @@ mod _serde {
         length: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         record_count: Option<u64>,
+        #[serde(
+            skip_serializing_if = "HashMap::is_empty",
+            serialize_with = "serialize_bounds"
+        )]
+        lower_bounds: &'a HashMap<i32, Datum>,
+        #[serde(
+            skip_serializing_if = "HashMap::is_empty",
+            serialize_with = "serialize_bounds"
+        )]
+        upper_bounds: &'a HashMap<i32, Datum>,
         #[serde(skip_serializing_if = "Option::is_none")]
         first_row_id: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -558,6 +630,8 @@ mod _serde {
                 start: value.start,
                 length: value.length,
                 record_count: value.record_count,
+                lower_bounds: &value.lower_bounds,
+                upper_bounds: &value.upper_bounds,
                 first_row_id: value.first_row_id,
                 data_sequence_number: value.data_sequence_number,
                 data_file_path: &value.data_file_path,
@@ -580,7 +654,7 @@ mod _serde {
 
     impl Serialize for FileScanTask {
         fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-        where S: serde::Serializer {
+        where S: Serializer {
             FileScanTaskRefSerde::try_from(self)
                 .map_err(serde::ser::Error::custom)?
                 .serialize(serializer)
@@ -608,6 +682,8 @@ mod _serde {
                 .with_start(value.start)
                 .with_length(value.length)
                 .with_record_count(value.record_count)
+                .with_lower_bounds(value.lower_bounds)
+                .with_upper_bounds(value.upper_bounds)
                 .with_first_row_id(value.first_row_id)
                 .with_data_sequence_number(value.data_sequence_number)
                 .with_data_file_path(value.data_file_path)

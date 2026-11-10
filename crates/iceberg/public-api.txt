@@ -1392,6 +1392,7 @@ pub fn iceberg::scan::FileScanTask::file_size_in_bytes(&self) -> u64
 pub fn iceberg::scan::FileScanTask::first_row_id(&self) -> core::option::Option<i64>
 pub fn iceberg::scan::FileScanTask::key_metadata(&self) -> core::option::Option<&[u8]>
 pub fn iceberg::scan::FileScanTask::length(&self) -> u64
+pub fn iceberg::scan::FileScanTask::lower_bounds(&self) -> &std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
 pub fn iceberg::scan::FileScanTask::name_mapping(&self) -> core::option::Option<&alloc::sync::Arc<iceberg::spec::NameMapping>>
 pub fn iceberg::scan::FileScanTask::partition(&self) -> core::option::Option<&iceberg::spec::Struct>
 pub fn iceberg::scan::FileScanTask::partition_spec(&self) -> core::option::Option<&alloc::sync::Arc<iceberg::spec::PartitionSpec>>
@@ -1404,6 +1405,7 @@ pub fn iceberg::scan::FileScanTask::sort_order(&self) -> core::option::Option<&i
 pub fn iceberg::scan::FileScanTask::sort_order_id(&self) -> core::option::Option<i32>
 pub fn iceberg::scan::FileScanTask::start(&self) -> u64
 pub fn iceberg::scan::FileScanTask::unified_partition_type(&self) -> core::option::Option<&alloc::sync::Arc<iceberg::spec::StructType>>
+pub fn iceberg::scan::FileScanTask::upper_bounds(&self) -> &std::collections::hash::map::HashMap<i32, iceberg::spec::Datum>
 pub fn iceberg::scan::FileScanTask::with_byte_range(self, start: u64, length: u64) -> iceberg::Result<Self>
 impl core::clone::Clone for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::clone(&self) -> iceberg::scan::FileScanTask
@@ -1415,7 +1417,7 @@ impl core::fmt::Debug for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for iceberg::scan::FileScanTask
 impl iceberg::scan::FileScanTask
-pub fn iceberg::scan::FileScanTask::builder() -> FileScanTaskBuilder<((), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), ())>
+pub fn iceberg::scan::FileScanTask::builder() -> FileScanTaskBuilder<((), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), (), ())>
 impl serde_core::ser::Serialize for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::serialize<S>(&self, serializer: S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg::scan::FileScanTask
