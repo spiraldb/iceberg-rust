@@ -552,7 +552,9 @@ impl VortexReadAt for FileReadVortexSource {
 /// Vortex applies filters exactly (not just for pruning), matching the row
 /// level filtering guarantees of the parquet read path. Like the parquet read
 /// path, predicate leaves referencing columns that do not exist in the file
-/// evaluate to "keep all rows".
+/// evaluate to "keep all rows". Integer range simplification preserves the rows
+/// where a filter is TRUE, rather than every three-valued Boolean result. NOT is
+/// eliminated before simplifying its leaves; callers must use the result as a filter.
 fn convert_predicate_to_vortex(
     predicate: &BoundPredicate,
     schema: &Schema,
@@ -575,9 +577,8 @@ fn convert_predicate_to_vortex(
                 convert_predicate_to_vortex(right, schema, file_dtype)?,
             ))
         }
-        BoundPredicate::Not(expr) => {
-            let [inner] = expr.inputs();
-            Ok(not(convert_predicate_to_vortex(inner, schema, file_dtype)?))
+        BoundPredicate::Not(_) => {
+            convert_predicate_to_vortex(&predicate.clone().rewrite_not(), schema, file_dtype)
         }
         BoundPredicate::Unary(expr) => {
             let Some(column) = column_expr(expr.term(), schema, file_dtype)? else {
@@ -603,7 +604,32 @@ fn convert_predicate_to_vortex(
                     starts_with_predicate(column.expr, expr.literal(), true)
                 }
                 op => {
-                    let literal = lit(datum_to_vortex_scalar(expr.literal(), &column.dtype)?);
+                    let literal = match file_literal(
+                        expr.literal(),
+                        &column.dtype,
+                        expr.term().field().field_type.as_ref(),
+                    )? {
+                        FileLiteral::Value(value) => lit(value),
+                        range => {
+                            // NOT has been normalized, so only the filter's TRUE set matters.
+                            let below = matches!(range, FileLiteral::BelowMin);
+                            let keep_non_null = match op {
+                                PredicateOperator::Eq => false,
+                                PredicateOperator::NotEq => true,
+                                PredicateOperator::LessThan | PredicateOperator::LessThanOrEq => {
+                                    !below
+                                }
+                                PredicateOperator::GreaterThan
+                                | PredicateOperator::GreaterThanOrEq => below,
+                                op => return Err(unsupported_predicate(op)),
+                            };
+                            return Ok(if keep_non_null {
+                                is_not_null(column.expr)
+                            } else {
+                                lit(false)
+                            });
+                        }
+                    };
                     match op {
                         PredicateOperator::LessThan => Ok(lt(column.expr, literal)),
                         PredicateOperator::LessThanOrEq => Ok(lt_eq(column.expr, literal)),
@@ -623,18 +649,26 @@ fn convert_predicate_to_vortex(
             let matches = expr
                 .literals()
                 .iter()
-                .map(|datum| {
-                    Ok(eq(
-                        column.expr.clone(),
-                        lit(datum_to_vortex_scalar(datum, &column.dtype)?),
-                    ))
+                .filter_map(|datum| {
+                    match file_literal(
+                        datum,
+                        &column.dtype,
+                        expr.term().field().field_type.as_ref(),
+                    ) {
+                        Ok(FileLiteral::Value(value)) => {
+                            Some(Ok(eq(column.expr.clone(), lit(value))))
+                        }
+                        Ok(FileLiteral::BelowMin | FileLiteral::AboveMax) => None,
+                        Err(error) => Some(Err(error)),
+                    }
                 })
                 .collect::<Result<Vec<_>>>()?;
             match expr.op() {
                 PredicateOperator::In => Ok(or_collect(matches).unwrap_or_else(|| lit(false))),
                 PredicateOperator::NotIn => Ok(match or_collect(matches) {
                     Some(any_match) => not(any_match),
-                    None => lit(true),
+                    None if expr.literals().is_empty() => lit(true),
+                    None => is_not_null(column.expr),
                 }),
                 op => Err(unsupported_predicate(op)),
             }
@@ -711,12 +745,8 @@ fn column_expr(
     let mut expr = names
         .iter()
         .fold(root(), |child, name| get_item(name.as_str(), child));
-    // Promote the column instead of narrowing the literal: out-of-range literals
-    // must remain valid filters after int/float/decimal schema evolution.
+    // Integer literals are adapted to the physical domain by file_literal.
     let promoted = match (&dtype, reference.field().field_type.as_ref()) {
-        (DType::Primitive(PType::I32, nullability), Type::Primitive(PrimitiveType::Long)) => {
-            Some(DType::Primitive(PType::I64, *nullability))
-        }
         (DType::Primitive(PType::F32, nullability), Type::Primitive(PrimitiveType::Double)) => {
             Some(DType::Primitive(PType::F64, *nullability))
         }
@@ -788,6 +818,49 @@ fn starts_with_predicate(column: Expression, prefix: &Datum, negated: bool) -> R
     } else {
         like(column, lit(pattern))
     })
+}
+
+enum FileLiteral {
+    Value(Scalar),
+    BelowMin,
+    AboveMax,
+}
+
+fn file_literal(datum: &Datum, file_dtype: &DType, field_type: &Type) -> Result<FileLiteral> {
+    if !matches!(
+        field_type,
+        Type::Primitive(PrimitiveType::Int | PrimitiveType::Long)
+    ) {
+        return datum_to_vortex_scalar(datum, file_dtype).map(FileLiteral::Value);
+    }
+    let integer = match (datum.data_type(), datum.literal()) {
+        (PrimitiveType::Int, PrimitiveLiteral::Int(value)) => Some(i128::from(*value)),
+        (PrimitiveType::Long, PrimitiveLiteral::Long(value)) => Some(i128::from(*value)),
+        _ => None,
+    };
+    if let (Some(value), DType::Primitive(ptype, _)) = (integer, file_dtype) {
+        macro_rules! narrow {
+            ($native:ty) => {{
+                return Ok(match <$native>::try_from(value) {
+                    Ok(value) => FileLiteral::Value(value.into()),
+                    Err(_) if value < i128::from(<$native>::MIN) => FileLiteral::BelowMin,
+                    Err(_) => FileLiteral::AboveMax,
+                });
+            }};
+        }
+        match ptype {
+            PType::I8 => narrow!(i8),
+            PType::I16 => narrow!(i16),
+            PType::I32 => narrow!(i32),
+            PType::I64 => narrow!(i64),
+            PType::U8 => narrow!(u8),
+            PType::U16 => narrow!(u16),
+            PType::U32 => narrow!(u32),
+            PType::U64 => narrow!(u64),
+            _ => {}
+        }
+    }
+    datum_to_vortex_scalar(datum, file_dtype).map(FileLiteral::Value)
 }
 
 fn datum_to_vortex_scalar(datum: &Datum, file_dtype: &DType) -> Result<Scalar> {
