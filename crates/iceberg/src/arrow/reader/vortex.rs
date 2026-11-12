@@ -40,7 +40,7 @@ use vortex::VortexSessionDefault;
 use vortex::array::VortexSessionExecute;
 use vortex::array::buffer::BufferHandle;
 use vortex::array::stream::ArrayStream;
-use vortex::arrow::ArrowSessionExt;
+use vortex::arrow::{ArrowSessionExt, ExecuteArrowExt};
 use vortex::buffer::{Alignment, ByteBuffer};
 use vortex::dtype::extension::Matcher;
 use vortex::dtype::{DType, DecimalDType, Nullability, PType};
@@ -340,9 +340,8 @@ pub(super) async fn read_vortex_task(
 
     let record_batch_stream = array_stream.map(move |chunk| {
         let chunk = chunk.map_err(to_iceberg_error)?;
-        let arrow_array = session
-            .arrow()
-            .execute_arrow(chunk, Some(&arrow_field), &mut execution_ctx)
+        let arrow_array = chunk
+            .execute_arrow(Some(&arrow_field), &mut execution_ctx)
             .map_err(to_iceberg_error)?;
         let batch = RecordBatch::from(arrow_array.as_struct());
         let mut batch = attach_field_id_metadata(batch, &file_schema)?;
@@ -472,9 +471,9 @@ pub(crate) async fn vortex_to_batch_stream(
         .map_err(to_iceberg_error)?;
     let mut ctx = session.create_execution_ctx();
     Ok(Box::pin(stream.map(move |chunk| {
-        let array = session
-            .arrow()
-            .execute_arrow(chunk.map_err(to_iceberg_error)?, Some(&field), &mut ctx)
+        let array = chunk
+            .map_err(to_iceberg_error)?
+            .execute_arrow(Some(&field), &mut ctx)
             .map_err(to_iceberg_error)?;
         let batch = RecordBatch::from(array.as_struct());
         match &schema {

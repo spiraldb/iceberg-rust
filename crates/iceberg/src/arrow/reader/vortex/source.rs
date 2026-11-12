@@ -651,7 +651,7 @@ mod tests {
     use tempfile::TempDir;
     use vortex::VortexSessionDefault;
     use vortex::array::VortexSessionExecute;
-    use vortex::arrow::ArrowSessionExt;
+    use vortex::arrow::{ArrowSessionExt, ExecuteArrowExt};
     use vortex::expr::{root, select};
     use vortex::scan::selection::Selection;
     use vortex::scan::{DataSource, ScanRequest};
@@ -746,10 +746,7 @@ mod tests {
                 .await
                 .unwrap();
             for array in arrays {
-                let array = session
-                    .arrow()
-                    .execute_arrow(array, Some(&field), &mut context)
-                    .unwrap();
+                let array = array.execute_arrow(Some(&field), &mut context).unwrap();
                 let batch = RecordBatch::from(array.as_struct());
                 ids.extend(
                     batch
