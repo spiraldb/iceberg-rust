@@ -891,14 +891,18 @@ impl ArrowReader {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::fs::File;
+    use std::fs::{File, metadata as file_metadata};
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
-    use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{
+        Array, ArrayRef, Decimal128Array, Float32Array, Int32Array, Int64Array, RecordBatch,
+        StringArray,
+    };
     use arrow_cast::cast;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
+    use futures::stream::iter as stream_iter;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
@@ -907,13 +911,204 @@ mod tests {
     use crate::Runtime;
     use crate::arrow::ArrowReaderBuilder;
     use crate::arrow::test_utils::write_encrypted_parquet;
+    use crate::expr::{Bind, Predicate as ScanPredicate, Reference};
     use crate::io::FileIO;
     use crate::metadata_columns::{
         RESERVED_COL_NAME_POS, RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_FILE,
         RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID,
     };
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
-    use crate::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, SchemaRef, Type};
+    use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
+
+    #[tokio::test]
+    async fn test_promoted_integer_predicates_preserve_values() {
+        let directory = TempDir::new().unwrap();
+        let (path, schema) = write_parquet_with_promoted_column(
+            directory.path().to_str().unwrap(),
+            Arc::new(Int32Array::from(vec![Some(1), Some(2), None])),
+            PrimitiveType::Long,
+        );
+
+        let task = metadata_projection_task_with_predicate(
+            path.clone(),
+            schema.clone(),
+            vec![1],
+            Reference::new("value").equal_to(Datum::long(i64::from(i32::MAX) + 1)),
+        );
+        let batches = read_batches(&[task], false).await;
+        assert_eq!(row_ids(&batches), Vec::<i32>::new());
+
+        let task = metadata_projection_task_with_predicate(
+            path.clone(),
+            schema.clone(),
+            vec![1],
+            Reference::new("value").not_equal_to(Datum::long(i64::from(i32::MAX) + 1)),
+        );
+        let batches = read_batches(&[task], false).await;
+        assert_eq!(row_ids(&batches), vec![1, 2]);
+
+        let task = metadata_projection_task_with_predicate(
+            path.clone(),
+            schema.clone(),
+            vec![1],
+            Reference::new("value").is_in([Datum::long(i64::from(i32::MAX) + 1), Datum::long(2)]),
+        );
+        let batches = read_batches(&[task], false).await;
+        assert_eq!(row_ids(&batches), vec![2]);
+
+        let task = metadata_projection_task_with_predicate(
+            path.clone(),
+            schema.clone(),
+            vec![1],
+            Reference::new("value")
+                .is_not_in([Datum::long(i64::from(i32::MAX) + 1), Datum::long(2)]),
+        );
+        let batches = read_batches(&[task], false).await;
+        assert_eq!(row_ids(&batches), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_promoted_float_predicates_preserve_values() {
+        // 0.5 is exact in f32 and f64; 0.1 rounds differently, so widening its f32 value
+        // must not make it equal to the f64 literal.
+        let directory = TempDir::new().unwrap();
+        let (path, schema) = write_parquet_with_promoted_column(
+            directory.path().to_str().unwrap(),
+            Arc::new(Float32Array::from(vec![Some(0.1), Some(0.5), None])),
+            PrimitiveType::Double,
+        );
+
+        let task = metadata_projection_task_with_predicate(
+            path.clone(),
+            schema.clone(),
+            vec![1],
+            Reference::new("value").equal_to(Datum::double(0.1)),
+        );
+        let batches = read_batches(&[task], false).await;
+        assert_eq!(row_ids(&batches), Vec::<i32>::new());
+
+        let task = metadata_projection_task_with_predicate(
+            path.clone(),
+            schema.clone(),
+            vec![1],
+            Reference::new("value").not_equal_to(Datum::double(0.1)),
+        );
+        let batches = read_batches(&[task], false).await;
+        assert_eq!(row_ids(&batches), vec![1, 2]);
+
+        let task = metadata_projection_task_with_predicate(
+            path.clone(),
+            schema.clone(),
+            vec![1],
+            Reference::new("value").is_in([Datum::double(0.1), Datum::double(0.5)]),
+        );
+        let batches = read_batches(&[task], false).await;
+        assert_eq!(row_ids(&batches), vec![2]);
+
+        let task = metadata_projection_task_with_predicate(
+            path.clone(),
+            schema.clone(),
+            vec![1],
+            Reference::new("value").is_not_in([Datum::double(0.1), Datum::double(0.5)]),
+        );
+        let batches = read_batches(&[task], false).await;
+        assert_eq!(row_ids(&batches), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_promoted_decimal_predicates_preserve_values() {
+        let directory = TempDir::new().unwrap();
+        let (path, schema) = write_parquet_with_promoted_column(
+            directory.path().to_str().unwrap(),
+            Arc::new(
+                Decimal128Array::from(vec![Some(123), Some(456), None])
+                    .with_precision_and_scale(3, 2)
+                    .unwrap(),
+            ),
+            PrimitiveType::Decimal {
+                precision: 9,
+                scale: 2,
+            },
+        );
+
+        let task = metadata_projection_task_with_predicate(
+            path.clone(),
+            schema.clone(),
+            vec![1],
+            Reference::new("value").equal_to(Datum::decimal_from_str("1000.00").unwrap()),
+        );
+        let batches = read_batches(&[task], false).await;
+        assert_eq!(row_ids(&batches), Vec::<i32>::new());
+
+        let task = metadata_projection_task_with_predicate(
+            path.clone(),
+            schema.clone(),
+            vec![1],
+            Reference::new("value").not_equal_to(Datum::decimal_from_str("1000.00").unwrap()),
+        );
+        let batches = read_batches(&[task], false).await;
+        assert_eq!(row_ids(&batches), vec![1, 2]);
+
+        let task = metadata_projection_task_with_predicate(
+            path.clone(),
+            schema.clone(),
+            vec![1],
+            Reference::new("value").is_in([
+                Datum::decimal_from_str("1000.00").unwrap(),
+                Datum::decimal_from_str("4.56").unwrap(),
+            ]),
+        );
+        let batches = read_batches(&[task], false).await;
+        assert_eq!(row_ids(&batches), vec![2]);
+
+        let task = metadata_projection_task_with_predicate(
+            path.clone(),
+            schema.clone(),
+            vec![1],
+            Reference::new("value").is_not_in([
+                Datum::decimal_from_str("1000.00").unwrap(),
+                Datum::decimal_from_str("4.56").unwrap(),
+            ]),
+        );
+        let batches = read_batches(&[task], false).await;
+        assert_eq!(row_ids(&batches), vec![1]);
+    }
+
+    fn write_parquet_with_promoted_column(
+        directory: &str,
+        values: ArrayRef,
+        logical_type: PrimitiveType,
+    ) -> (String, SchemaRef) {
+        let field = Field::new("value", values.data_type().clone(), true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_owned(), "2".to_owned())]),
+        );
+        let path = write_plain_parquet(directory, "data.parquet", vec![field], vec![values]);
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "value", Type::Primitive(logical_type)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        (path, schema)
+    }
+
+    fn row_ids(batches: &[RecordBatch]) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
 
     // INT96 encoding: [nanos_low_u32, nanos_high_u32, julian_day_u32]
     // Julian day 2_440_588 = Unix epoch (1970-01-01)
@@ -3371,6 +3566,44 @@ mod tests {
             .with_first_row_id(first_row_id)
             .with_case_sensitive(false)
             .build()
+            .unwrap()
+    }
+
+    fn metadata_projection_task_with_predicate(
+        file_path: String,
+        schema: SchemaRef,
+        project_field_ids: Vec<i32>,
+        predicate: ScanPredicate,
+    ) -> FileScanTask {
+        let predicate = predicate.bind(schema.clone(), false).unwrap();
+        FileScanTask::builder()
+            .with_file_size_in_bytes(file_metadata(&file_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(file_path)
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(project_field_ids)
+            .with_predicate(Some(predicate))
+            .with_case_sensitive(false)
+            .build()
+            .unwrap()
+    }
+
+    async fn read_batches(
+        tasks: &[FileScanTask],
+        row_group_filtering_enabled: bool,
+    ) -> Vec<RecordBatch> {
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+            .with_row_group_filtering_enabled(row_group_filtering_enabled)
+            .build();
+        let tasks: FileScanTaskStream = Box::pin(stream_iter(tasks.to_vec().into_iter().map(Ok)));
+        reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect()
+            .await
             .unwrap()
     }
 
