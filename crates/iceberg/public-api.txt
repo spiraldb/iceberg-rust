@@ -105,10 +105,20 @@ pub struct iceberg::arrow::ScanResult
 impl iceberg::scan::ScanResult
 pub fn iceberg::scan::ScanResult::metrics(&self) -> &iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanResult::stream(self) -> iceberg::scan::ArrowRecordBatchStream
+pub struct iceberg::arrow::VortexScanCache
+impl iceberg::arrow::VortexScanCache
+pub fn iceberg::arrow::VortexScanCache::bytes_read(&self) -> u64
+pub fn iceberg::arrow::VortexScanCache::new(file_io: iceberg::io::FileIO, session: vortex_session::session::VortexSession, runtime: iceberg::Runtime) -> Self
+pub fn iceberg::arrow::VortexScanCache::session(&self) -> &vortex_session::session::VortexSession
+impl core::clone::Clone for iceberg::arrow::VortexScanCache
+pub fn iceberg::arrow::VortexScanCache::clone(&self) -> iceberg::arrow::VortexScanCache
+impl core::fmt::Debug for iceberg::arrow::VortexScanCache
+pub fn iceberg::arrow::VortexScanCache::fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::arrow::VortexScanSource
 impl iceberg::arrow::VortexScanSource
 pub fn iceberg::arrow::VortexScanSource::bytes_read(&self) -> u64
 pub async fn iceberg::arrow::VortexScanSource::try_new(file_io: iceberg::io::FileIO, schema: iceberg::spec::SchemaRef, tasks: alloc::vec::Vec<iceberg::scan::FileScanTask>, session: vortex_session::session::VortexSession, target_parallelism: core::num::nonzero::NonZeroUsize) -> iceberg::Result<core::option::Option<Self>>
+pub async fn iceberg::arrow::VortexScanSource::try_new_with_cache(cache: &iceberg::arrow::VortexScanCache, schema: iceberg::spec::SchemaRef, tasks: alloc::vec::Vec<iceberg::scan::FileScanTask>, target_parallelism: core::num::nonzero::NonZeroUsize) -> iceberg::Result<core::option::Option<Self>>
 impl vortex_scan::DataSource for iceberg::arrow::VortexScanSource
 pub fn iceberg::arrow::VortexScanSource::dtype(&self) -> &vortex_array::dtype::DType
 pub fn iceberg::arrow::VortexScanSource::field_statistics<'life0, 'life1, 'async_trait>(&'life0 self, _field: &'life1 vortex_array::dtype::field::FieldPath) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = vortex_error::VortexResult<vortex_array::stats::stats_set::StatsSet>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
@@ -3420,6 +3430,7 @@ pub fn iceberg::table::Table::metadata_location_result(&self) -> iceberg::Result
 pub fn iceberg::table::Table::metadata_ref(&self) -> iceberg::spec::TableMetadataRef
 pub fn iceberg::table::Table::reader_builder(&self) -> iceberg::arrow::ArrowReaderBuilder
 pub fn iceberg::table::Table::readonly(&self) -> bool
+pub fn iceberg::table::Table::runtime(&self) -> &iceberg::Runtime
 pub fn iceberg::table::Table::scan(&self) -> iceberg::scan::TableScanBuilder<'_>
 pub fn iceberg::table::Table::with_runtime(self, runtime: iceberg::Runtime) -> Self
 impl core::clone::Clone for iceberg::table::Table

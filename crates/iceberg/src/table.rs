@@ -292,7 +292,11 @@ impl Table {
     }
 
     /// Returns the [`Runtime`] for this table.
-    pub(crate) fn runtime(&self) -> &Runtime {
+    ///
+    /// This borrows execution handles rather than owning the underlying Tokio runtime. The
+    /// caller must keep that runtime alive while table planning and reads are in progress,
+    /// following [`Runtime`]'s lifetime contract.
+    pub fn runtime(&self) -> &Runtime {
         &self.runtime
     }
 

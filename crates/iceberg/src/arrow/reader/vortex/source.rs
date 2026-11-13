@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod cache;
+
 use std::any::Any;
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -23,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 
 use async_trait::async_trait;
+pub use cache::VortexScanCache;
 use futures::{StreamExt, stream};
 use vortex::array::stats::StatsSet;
 use vortex::array::stream::{ArrayStreamAdapter, SendableArrayStream};
@@ -32,7 +35,6 @@ use vortex::error::{VortexResult, vortex_bail};
 use vortex::expr::stats::Precision;
 use vortex::expr::transform::replace;
 use vortex::expr::{BoundExpression, Expression, and_collect, cast, get_item, lit, pack, root};
-use vortex::file::VortexFile;
 use vortex::scalar::Scalar;
 use vortex::scan::selection::Selection;
 use vortex::scan::{
@@ -41,14 +43,14 @@ use vortex::scan::{
 };
 use vortex::session::VortexSession;
 
-use super::{byte_range_to_rows, convert_predicate_to_vortex, open_vortex_file};
-use crate::Result;
+use super::{byte_range_to_rows, convert_predicate_to_vortex};
 use crate::arrow::vortex_util::VORTEX_SCHEMA_KEY;
 use crate::arrow::{schema_to_arrow_schema, to_iceberg_error};
 use crate::io::FileIO;
 use crate::metadata_columns::is_metadata_field;
 use crate::scan::FileScanTask;
 use crate::spec::{DataFileFormat, PrimitiveType, Schema, SchemaRef, Type};
+use crate::{Result, Runtime};
 
 /// Scans supported Iceberg Vortex tasks into Vortex arrays.
 ///
@@ -67,7 +69,7 @@ impl VortexScanSource {
     /// optional fields without defaults. Deletes, partition constants, and metadata columns
     /// need the Arrow reader.
     /// All file schemas are checked before this method returns a usable source.
-    /// Keep the runtime that opens these files alive and driven while using the source.
+    /// The caller must keep the current Tokio runtime alive while the source is in use.
     pub async fn try_new(
         file_io: FileIO,
         schema: SchemaRef,
@@ -75,6 +77,21 @@ impl VortexScanSource {
         session: VortexSession,
         target_parallelism: NonZeroUsize,
     ) -> Result<Option<Self>> {
+        let cache = VortexScanCache::new(file_io, session, Runtime::try_current()?);
+        Self::try_new_with_cache(&cache, schema, tasks, target_parallelism).await
+    }
+
+    /// Prepares a scan while reusing immutable file handles from `cache`.
+    ///
+    /// The same supported-task checks as [`Self::try_new`] apply. Schemas, defaults,
+    /// predicates, and ranges are validated for this scan, independently of cached file handles.
+    pub async fn try_new_with_cache(
+        cache: &VortexScanCache,
+        schema: SchemaRef,
+        tasks: Vec<FileScanTask>,
+        target_parallelism: NonZeroUsize,
+    ) -> Result<Option<Self>> {
+        let session = cache.session();
         if schema.as_struct().fields().iter().any(|field| {
             !matches!(field.field_type.as_ref(), Type::Primitive(_)) || is_metadata_field(field.id)
         }) || tasks.iter().any(|task| {
@@ -92,22 +109,16 @@ impl VortexScanSource {
         }) {
             return Ok(None);
         }
-        let Some(dtype) = array_source_dtype(&schema, &session) else {
+        let Some(dtype) = array_source_dtype(&schema, session) else {
             return Ok(None);
         };
-        let bytes_read = Arc::new(AtomicU64::new(0));
+        let bytes_read = Arc::clone(cache.bytes_read_counter());
         let mut prepared = Vec::with_capacity(tasks.len());
         // A partially supported snapshot must never yield rows before the caller falls back.
         for task in tasks {
-            let (file, file_size) = open_vortex_file(
-                task.data_file_path(),
-                task.file_size_in_bytes(),
-                task.key_metadata(),
-                &file_io,
-                Arc::clone(&bytes_read),
-                &session,
-            )
-            .await?;
+            let (file, file_size) = cache
+                .open(task.data_file_path(), task.file_size_in_bytes())
+                .await?;
             let file_schema = match file.metadata_segment(VORTEX_SCHEMA_KEY) {
                 Some(bytes) => serde_json::from_slice::<Schema>(bytes.as_slice())?,
                 None => {
@@ -125,7 +136,7 @@ impl VortexScanSource {
                     Schema::try_from(arrow_schema.as_ref())?
                 }
             };
-            let Some(expected_file_dtype) = array_source_dtype(&file_schema, &session) else {
+            let Some(expected_file_dtype) = array_source_dtype(&file_schema, session) else {
                 return Ok(None);
             };
             if file.dtype() != &expected_file_dtype {
@@ -138,11 +149,10 @@ impl VortexScanSource {
             let predicate = task
                 .predicate()
                 .map(|predicate| {
-                    convert_predicate_to_vortex(
-                        &predicate.clone().rewrite_not(),
-                        &file_schema,
-                        file.dtype(),
-                    )
+                    // Directly built or deserialized tasks may bypass TableScan's NOT rewrite.
+                    // A conservative missing-field match must not be negated into a false match.
+                    let predicate = predicate.clone().rewrite_not();
+                    convert_predicate_to_vortex(&predicate, &file_schema, file.dtype())
                 })
                 .transpose()?;
             let rows = if task.start() == 0 && task.length() == 0 {
@@ -174,7 +184,7 @@ impl VortexScanSource {
                     .into_iter()
                     .map(move |(rows, bytes)| {
                         Arc::new(PreparedTask {
-                            file: task.file.clone(),
+                            file: Arc::clone(&task.file),
                             normalize: task.normalize.clone(),
                             predicate: task.predicate.clone(),
                             rows,
@@ -190,14 +200,17 @@ impl VortexScanSource {
         }))
     }
 
-    /// Returns bytes read through Iceberg FileIO, including file metadata.
+    /// Returns cumulative bytes read through this source's cache, including file metadata.
+    ///
+    /// Sources prepared with the same [`VortexScanCache`] share this counter. It includes reads
+    /// from concurrent and previous scans, and is not a per-query IO measurement.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(Ordering::Relaxed)
     }
 }
 
 struct PreparedTask {
-    file: VortexFile,
+    file: Arc<vortex::file::VortexFile>,
     normalize: Expression,
     predicate: Option<Expression>,
     rows: Range<u64>,
@@ -562,13 +575,15 @@ mod tests {
     use vortex::session::VortexSession;
 
     use super::{
-        VortexScanSource, array_source_dtype, reserve_rows, task_ranges, task_rows, task_selection,
+        VortexScanCache, VortexScanSource, array_source_dtype, reserve_rows, task_ranges,
+        task_rows, task_selection,
     };
+    use crate::Runtime;
     use crate::arrow::schema_to_arrow_schema;
     use crate::expr::{Bind, BoundPredicate, Reference};
     use crate::io::FileIO;
     use crate::scan::FileScanTask;
-    use crate::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, SchemaRef, Type};
+    use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
     use crate::writer::file_writer::{FileWriter, FileWriterBuilder, VortexWriterBuilder};
 
     fn source_task(
@@ -667,6 +682,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_preparation_reuses_metadata_and_keeps_predicates_query_local() {
+        let (_directory, file_io, schema, task) = source_fixture().await;
+        let cache = VortexScanCache::new(file_io, VortexSession::default(), Runtime::current());
+        let parallelism = NonZeroUsize::new(4).unwrap();
+        let source = VortexScanSource::try_new_with_cache(
+            &cache,
+            schema.clone(),
+            vec![task.clone()],
+            parallelism,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let metadata_bytes = cache.bytes_read();
+        assert!(metadata_bytes > 0);
+        let predicate = Reference::new("id")
+            .greater_than(Datum::long(120))
+            .bind(schema.clone(), true)
+            .unwrap();
+        let filtered_task = source_task(
+            task.data_file_path(),
+            task.file_size_in_bytes(),
+            schema.clone(),
+            Some(predicate),
+        );
+        let filtered =
+            VortexScanSource::try_new_with_cache(&cache, schema, vec![filtered_task], parallelism)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(cache.bytes_read(), metadata_bytes);
+        assert_eq!(
+            source_ids(&source, cache.session()).await,
+            (0..128).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            source_ids(&filtered, cache.session()).await,
+            (121..128).collect::<Vec<_>>()
+        );
+        assert_eq!(source.bytes_read(), cache.bytes_read());
+        assert_eq!(filtered.bytes_read(), cache.bytes_read());
+    }
+
+    #[tokio::test]
+    async fn concurrent_cached_preparation_coalesces_file_opens() {
+        let (_directory, file_io, schema, task) = source_fixture().await;
+        let session = VortexSession::default();
+        let single_cache =
+            VortexScanCache::new(file_io.clone(), session.clone(), Runtime::current());
+        let parallelism = NonZeroUsize::new(4).unwrap();
+        VortexScanSource::try_new_with_cache(
+            &single_cache,
+            schema.clone(),
+            vec![task.clone()],
+            parallelism,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let cache = VortexScanCache::new(file_io, session, Runtime::current());
+        let (first, second) = futures::try_join!(
+            VortexScanSource::try_new_with_cache(
+                &cache,
+                schema.clone(),
+                vec![task.clone()],
+                parallelism
+            ),
+            VortexScanSource::try_new_with_cache(&cache, schema, vec![task], parallelism),
+        )
+        .unwrap();
+        assert_eq!(cache.bytes_read(), single_cache.bytes_read());
+        for source in [first.unwrap(), second.unwrap()] {
+            assert_eq!(
+                source_ids(&source, cache.session()).await,
+                (0..128).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn directly_built_tasks_rewrite_not_before_matching_missing_fields() {
         let (_directory, file_io, schema, task) = source_fixture().await;
         let evolved = Arc::new(
@@ -695,15 +790,27 @@ mod tests {
         );
         let parallelism = NonZeroUsize::new(4).unwrap();
         let session = VortexSession::default();
-        let fresh =
-            VortexScanSource::try_new(file_io, evolved, vec![task], session.clone(), parallelism)
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(
-            source_ids(&fresh, &session).await,
-            (0..128).collect::<Vec<_>>()
-        );
+        let fresh = VortexScanSource::try_new(
+            file_io.clone(),
+            evolved.clone(),
+            vec![task.clone()],
+            session.clone(),
+            parallelism,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let cache = VortexScanCache::new(file_io, session, Runtime::current());
+        let cached = VortexScanSource::try_new_with_cache(&cache, evolved, vec![task], parallelism)
+            .await
+            .unwrap()
+            .unwrap();
+        for source in [fresh, cached] {
+            assert_eq!(
+                source_ids(&source, cache.session()).await,
+                (0..128).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[tokio::test]
