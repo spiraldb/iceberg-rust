@@ -38,7 +38,7 @@ use vortex::VortexSessionDefault;
 use vortex::array::VortexSessionExecute;
 use vortex::array::buffer::BufferHandle;
 use vortex::array::stream::ArrayStream;
-use vortex::arrow::ArrowSessionExt;
+use vortex::arrow::{ArrowSessionExt, ExecuteArrowExt};
 use vortex::buffer::{Alignment, ByteBuffer};
 use vortex::dtype::extension::Matcher;
 use vortex::dtype::{DType, DecimalDType, Nullability, PType};
@@ -329,9 +329,8 @@ pub(super) async fn read_vortex_task(
 
     let record_batch_stream = array_stream.map(move |chunk| {
         let chunk = chunk.map_err(to_iceberg_error)?;
-        let arrow_array = session
-            .arrow()
-            .execute_arrow(chunk, Some(&arrow_field), &mut execution_ctx)
+        let arrow_array = chunk
+            .execute_arrow(Some(&arrow_field), &mut execution_ctx)
             .map_err(to_iceberg_error)?;
         let batch = RecordBatch::from(arrow_array.as_struct());
         let mut batch = attach_field_id_metadata(batch, &file_schema)?;
@@ -447,9 +446,9 @@ pub(crate) async fn vortex_to_batch_stream(
         .map_err(to_iceberg_error)?;
     let mut ctx = session.create_execution_ctx();
     Ok(Box::pin(stream.map(move |chunk| {
-        let array = session
-            .arrow()
-            .execute_arrow(chunk.map_err(to_iceberg_error)?, Some(&field), &mut ctx)
+        let array = chunk
+            .map_err(to_iceberg_error)?
+            .execute_arrow(Some(&field), &mut ctx)
             .map_err(to_iceberg_error)?;
         let batch = RecordBatch::from(array.as_struct());
         match &schema {
@@ -781,7 +780,7 @@ fn datum_to_vortex_scalar(datum: &Datum, file_dtype: &DType) -> Result<Scalar> {
                     format!("Cannot compare UUID to Vortex column of type {file_dtype}"),
                 ));
             };
-            if !ext.is::<vortex::extension::uuid::Uuid>() {
+            if !ext.is::<vortex::encodings::uuid::Uuid>() {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
                     format!("Cannot compare UUID to Vortex extension {ext}"),
@@ -2125,10 +2124,14 @@ mod tests {
         let file = write_batch_file(&path, &io, schema.clone(), &batch).await;
         assert_eq!(file.null_value_counts().get(&1), Some(&1));
         assert!(!file.null_value_counts().contains_key(&3));
-        for id in [1, 3] {
-            assert!(!file.lower_bounds().contains_key(&id));
-            assert!(!file.upper_bounds().contains_key(&id));
-        }
+        assert_eq!(
+            file.lower_bounds(),
+            &std::collections::HashMap::from([(1, Datum::uuid(uuids[0]))])
+        );
+        assert_eq!(
+            file.upper_bounds(),
+            &std::collections::HashMap::from([(1, Datum::uuid(uuids[1]))])
+        );
         let session = VortexSession::default();
         let (opened, _) = super::open_vortex_file(
             &path,
