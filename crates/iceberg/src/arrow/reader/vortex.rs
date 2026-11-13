@@ -25,6 +25,8 @@
 //! coercion and modular encryption do not apply here. Byte splits are mapped
 //! proportionally to row ranges using the file size and exact row count.
 
+pub(crate) mod source;
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 

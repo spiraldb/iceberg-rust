@@ -38,6 +38,7 @@ pub(crate) use record_batch_transformer::build_partition_constant;
 mod scan_metrics;
 mod value;
 
+pub use reader::vortex::source::VortexScanSource;
 pub use reader::*;
 pub use scan_metrics::{ScanMetrics, ScanResult};
 pub use value::*;
