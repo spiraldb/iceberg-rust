@@ -308,6 +308,13 @@ impl TableTestFixture {
     }
 
     pub(crate) async fn setup_manifest_files(&mut self) {
+        self.setup_manifest_files_with_split_offsets(None).await;
+    }
+
+    pub(crate) async fn setup_manifest_files_with_split_offsets(
+        &mut self,
+        split_offsets: Option<Vec<i64>>,
+    ) {
         let current_snapshot = self.table.metadata().current_snapshot().unwrap();
         let parent_snapshot = current_snapshot
             .parent_snapshot(self.table.metadata())
@@ -338,6 +345,7 @@ impl TableTestFixture {
                             .file_size_in_bytes(parquet_file_size)
                             .record_count(1)
                             .partition(Struct::from_iter([Some(Literal::long(100))]))
+                            .split_offsets(split_offsets)
                             .key_metadata(None)
                             .build()
                             .unwrap(),

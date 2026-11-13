@@ -1432,6 +1432,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_plan_files_preserves_split_offsets() {
+        let mut fixture = TableTestFixture::new();
+        fixture
+            .setup_manifest_files_with_split_offsets(Some(vec![4, 128]))
+            .await;
+
+        let mut tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        tasks.sort_by_key(|task| task.data_file_path().to_string());
+
+        assert_eq!(
+            tasks
+                .iter()
+                .map(FileScanTask::split_offsets)
+                .collect::<Vec<_>>(),
+            vec![Some([4, 128].as_slice()), None]
+        );
+        let task = &tasks[0];
+        assert_eq!(task.start(), 0);
+        assert_eq!(task.length(), task.file_size_in_bytes());
+        let json = serde_json::to_string(task).unwrap();
+        assert_eq!(serde_json::from_str::<FileScanTask>(&json).unwrap(), *task);
+    }
+
+    #[tokio::test]
+    async fn test_file_scan_task_without_split_offsets_deserializes() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        let tasks: Vec<FileScanTask> = fixture
+            .table
+            .scan()
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let task = &tasks[0];
+        let json = serde_json::to_value(task).unwrap();
+        assert!(json.get("split_offsets").is_none());
+        assert_eq!(serde_json::from_value::<FileScanTask>(json).unwrap(), *task);
+    }
+
+    #[tokio::test]
     async fn test_plan_files_carries_name_mapping_into_file_scan_task() {
         let mut fixture = TableTestFixture::new();
         fixture.setup_manifest_files().await;

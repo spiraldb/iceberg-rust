@@ -54,6 +54,10 @@ pub struct FileScanTask {
     #[builder(default)]
     record_count: Option<u64>,
 
+    /// Suggested split offsets in bytes from the start of the data file.
+    #[builder(default)]
+    split_offsets: Option<Vec<i64>>,
+
     /// The first row id assigned to the data file.
     ///
     /// Used to derive the `_row_id` metadata column: for a row without an
@@ -171,6 +175,11 @@ impl FileScanTask {
     /// Returns the number of records in the file when the whole file is scanned.
     pub fn record_count(&self) -> Option<u64> {
         self.record_count
+    }
+
+    /// Returns the suggested split offsets in bytes from the start of the data file.
+    pub fn split_offsets(&self) -> Option<&[i64]> {
+        self.split_offsets.as_deref()
     }
 
     /// Returns the first row id assigned to the data file.
@@ -449,6 +458,8 @@ mod _serde {
         start: u64,
         length: u64,
         record_count: Option<u64>,
+        #[serde(default)]
+        split_offsets: Option<Vec<i64>>,
         first_row_id: Option<i64>,
         data_sequence_number: Option<i64>,
         data_file_path: String,
@@ -481,6 +492,8 @@ mod _serde {
         length: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         record_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        split_offsets: Option<&'a [i64]>,
         #[serde(skip_serializing_if = "Option::is_none")]
         first_row_id: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -539,6 +552,7 @@ mod _serde {
                 start: value.start,
                 length: value.length,
                 record_count: value.record_count,
+                split_offsets: value.split_offsets.as_deref(),
                 first_row_id: value.first_row_id,
                 data_sequence_number: value.data_sequence_number,
                 data_file_path: &value.data_file_path,
@@ -589,6 +603,7 @@ mod _serde {
                 .with_start(value.start)
                 .with_length(value.length)
                 .with_record_count(value.record_count)
+                .with_split_offsets(value.split_offsets)
                 .with_first_row_id(value.first_row_id)
                 .with_data_sequence_number(value.data_sequence_number)
                 .with_data_file_path(value.data_file_path)
