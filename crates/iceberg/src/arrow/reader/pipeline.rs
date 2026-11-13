@@ -891,29 +891,115 @@ impl ArrowReader {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::fs::File;
+    use std::fs::{File, metadata as file_metadata};
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
-    use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{
+        Array, ArrayRef, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    };
     use arrow_cast::cast;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
+    use futures::stream::iter as stream_iter;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
-    use parquet::file::properties::WriterProperties;
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use tempfile::TempDir;
 
     use crate::Runtime;
     use crate::arrow::ArrowReaderBuilder;
     use crate::arrow::test_utils::write_encrypted_parquet;
+    use crate::expr::{Bind, Reference};
     use crate::io::FileIO;
     use crate::metadata_columns::{
         RESERVED_COL_NAME_POS, RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_FILE,
         RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID,
     };
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
-    use crate::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, SchemaRef, Type};
+    use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
+
+    #[tokio::test]
+    async fn test_promoted_page_bounds_preserve_rows() {
+        for (values, logical, literal) in [
+            (
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                PrimitiveType::Long,
+                Datum::long(2),
+            ),
+            (
+                Arc::new(Float32Array::from(vec![0.25, 0.5, 0.75])) as ArrayRef,
+                PrimitiveType::Double,
+                Datum::double(0.5),
+            ),
+        ] {
+            let directory = TempDir::new().unwrap();
+            let field = Field::new("value", values.data_type().clone(), true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_owned(), "2".to_owned())]),
+            );
+            let properties = WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .set_data_page_row_count_limit(1)
+                .set_write_batch_size(1)
+                .set_statistics_enabled(EnabledStatistics::Page)
+                .build();
+            let path = write_parquet_with(
+                directory.path().to_str().unwrap(),
+                "data.parquet",
+                vec![field],
+                vec![values],
+                properties,
+            );
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                        NestedField::optional(2, "value", Type::Primitive(logical)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            );
+            let task = FileScanTask::builder()
+                .with_file_size_in_bytes(file_metadata(&path).unwrap().len())
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(path)
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1])
+                .with_predicate(Some(
+                    Reference::new("value")
+                        .less_than(literal)
+                        .bind(schema, false)
+                        .unwrap(),
+                ))
+                .with_case_sensitive(false)
+                .build()
+                .unwrap();
+            for page_pruning in [false, true] {
+                let batches: Vec<RecordBatch> =
+                    ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                        .with_row_group_filtering_enabled(false)
+                        .with_row_selection_enabled(page_pruning)
+                        .build()
+                        .read(Box::pin(stream_iter([Ok(task.clone())])))
+                        .unwrap()
+                        .stream()
+                        .try_collect()
+                        .await
+                        .unwrap();
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                assert_eq!(
+                    batches[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap(),
+                    &Int32Array::from(vec![1])
+                );
+            }
+        }
+    }
 
     // INT96 encoding: [nanos_low_u32, nanos_high_u32, julian_day_u32]
     // Julian day 2_440_588 = Unix epoch (1970-01-01)

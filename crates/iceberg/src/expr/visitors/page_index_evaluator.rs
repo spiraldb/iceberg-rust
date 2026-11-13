@@ -306,18 +306,8 @@ impl<'a> PageIndexEvaluator<'a> {
                 .zip(row_counts.iter())
                 .map(|((i, (min, max)), &row_count)| {
                     predicate(
-                        min.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Float(OrderedFloat::from(val)),
-                            )
-                        }),
-                        max.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Float(OrderedFloat::from(val)),
-                            )
-                        }),
+                        min.map(|&val| Self::float_bound_to_datum(field_type, val)),
+                        max.map(|&val| Self::float_bound_to_datum(field_type, val)),
                         PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
                     )
                 })
@@ -485,6 +475,7 @@ impl<'a> PageIndexEvaluator<'a> {
     /// primitive type.
     fn int32_bound_to_datum(field_type: &PrimitiveType, val: i32) -> Datum {
         match field_type {
+            PrimitiveType::Long => Datum::long(val),
             PrimitiveType::Decimal { .. } => Datum::new(
                 field_type.clone(),
                 PrimitiveLiteral::Int128(i128::from(val)),
@@ -502,6 +493,16 @@ impl<'a> PageIndexEvaluator<'a> {
                 PrimitiveLiteral::Int128(i128::from(val)),
             ),
             _ => Datum::new(field_type.clone(), PrimitiveLiteral::Long(val)),
+        }
+    }
+
+    fn float_bound_to_datum(field_type: &PrimitiveType, val: f32) -> Datum {
+        match field_type {
+            PrimitiveType::Double => Datum::double(f64::from(val)),
+            _ => Datum::new(
+                field_type.clone(),
+                PrimitiveLiteral::Float(OrderedFloat::from(val)),
+            ),
         }
     }
 
