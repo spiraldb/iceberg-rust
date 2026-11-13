@@ -17,7 +17,6 @@
 
 //! Shared helpers for the vortex file format integration.
 
-use vortex::arrow::ExecuteArrowExt;
 use vortex::error::VortexError;
 use vortex::extension::datetime::TimeUnit;
 
@@ -283,8 +282,9 @@ pub(crate) fn evolve_nested_fields(
                     .arrow()
                     .from_arrow_array(array.clone(), &source)
                     .map_err(to_iceberg_error)?;
-                array
-                    .execute_arrow(Some(&target), &mut session.create_execution_ctx())
+                session
+                    .arrow()
+                    .execute_arrow(array, Some(&target), &mut session.create_execution_ctx())
                     .map_err(to_iceberg_error)
             }
             (
