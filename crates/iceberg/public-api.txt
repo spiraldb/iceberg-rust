@@ -83,7 +83,6 @@ pub fn iceberg::arrow::ArrowReaderBuilder::with_row_filter_factory<F>(self, fact
 pub fn iceberg::arrow::ArrowReaderBuilder::with_row_group_filtering_enabled(self, row_group_filtering_enabled: bool) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_row_selection_enabled(self, row_selection_enabled: bool) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_view_types(self, view_types: bool) -> Self
-pub fn iceberg::arrow::ArrowReaderBuilder::with_vortex_layout_splits(self, enabled: bool) -> Self
 pub struct iceberg::arrow::PartitionValueCalculator
 impl iceberg::arrow::PartitionValueCalculator
 pub fn iceberg::arrow::PartitionValueCalculator::calculate(&self, batch: &arrow_array::record_batch::RecordBatch) -> iceberg::Result<arrow_array::array::ArrayRef>

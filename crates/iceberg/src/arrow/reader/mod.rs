@@ -74,7 +74,6 @@ use projection::{
 pub struct ArrowReaderBuilder {
     batch_size: Option<usize>,
     view_types: bool,
-    vortex_layout_splits: bool,
     file_io: FileIO,
     concurrency_limit_data_files: usize,
     row_group_filtering_enabled: bool,
@@ -95,7 +94,6 @@ impl ArrowReaderBuilder {
         ArrowReaderBuilder {
             batch_size: None,
             view_types: false,
-            vortex_layout_splits: false,
             file_io,
             concurrency_limit_data_files: num_cpus,
             row_group_filtering_enabled: true,
@@ -125,12 +123,6 @@ impl ArrowReaderBuilder {
     /// Requests top-level string and binary columns as view arrays.
     pub fn with_view_types(mut self, view_types: bool) -> Self {
         self.view_types = view_types;
-        self
-    }
-
-    /// Uses Vortex layout splits while limiting filtered output batches to the requested size.
-    pub fn with_vortex_layout_splits(mut self, enabled: bool) -> Self {
-        self.vortex_layout_splits = enabled;
         self
     }
 
@@ -223,7 +215,6 @@ impl ArrowReaderBuilder {
         ArrowReader {
             batch_size: self.batch_size,
             view_types: self.view_types,
-            vortex_layout_splits: self.vortex_layout_splits,
             file_io: self.file_io.clone(),
             delete_file_loader: CachingDeleteFileLoader::new(
                 self.file_io.clone(),
@@ -248,7 +239,6 @@ impl ArrowReaderBuilder {
 pub struct ArrowReader {
     batch_size: Option<usize>,
     view_types: bool,
-    vortex_layout_splits: bool,
     file_io: FileIO,
     delete_file_loader: CachingDeleteFileLoader,
 

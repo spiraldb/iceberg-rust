@@ -71,7 +71,6 @@ impl ArrowReader {
         let task_reader = FileScanTaskReader {
             batch_size: self.batch_size,
             view_types: self.view_types,
-            vortex_layout_splits: self.vortex_layout_splits,
             file_io: self.file_io,
             delete_file_loader: self
                 .delete_file_loader
@@ -140,7 +139,6 @@ const PRUNABLE_METADATA_FIELDS: &[i32] = &[
 struct FileScanTaskReader {
     batch_size: Option<usize>,
     view_types: bool,
-    vortex_layout_splits: bool,
     file_io: FileIO,
     delete_file_loader: CachingDeleteFileLoader,
     row_group_filtering_enabled: bool,
@@ -172,7 +170,6 @@ impl FileScanTaskReader {
                     &self.file_io,
                     self.batch_size,
                     self.view_types,
-                    self.vortex_layout_splits,
                     &self.delete_file_loader,
                     self.scan_metrics.bytes_read_counter().clone(),
                 )

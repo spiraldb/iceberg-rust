@@ -52,7 +52,6 @@ use vortex::expr::{
 use vortex::extension::datetime::{AnyTemporal, TimeUnit};
 use vortex::file::OpenOptionsSessionExt;
 use vortex::io::VortexReadAt;
-use vortex::layout::scan::split_by::SplitBy;
 use vortex::scalar::{DecimalValue, Scalar};
 use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
@@ -81,11 +80,10 @@ pub(super) async fn read_vortex_task(
     file_io: &FileIO,
     batch_size: Option<usize>,
     view_types: bool,
-    layout_splits: bool,
     delete_file_loader: &CachingDeleteFileLoader,
     bytes_read_counter: Arc<AtomicU64>,
 ) -> Result<ArrowRecordBatchStream> {
-    if layout_splits && batch_size == Some(0) {
+    if batch_size == Some(0) {
         return Err(Error::new(
             ErrorKind::DataInvalid,
             "Vortex output batch size must be greater than zero",
@@ -222,10 +220,6 @@ pub(super) async fn read_vortex_task(
         )
         .with_some_filter(filter)
         .with_row_range(row_range);
-    if !layout_splits && let Some(batch_size) = batch_size {
-        scan_builder = scan_builder.with_split_by(SplitBy::RowCount(batch_size));
-    }
-
     // Positional deletes are applied by excluding the deleted row ordinals
     // from the scan. Vortex selections compose with the filter expression.
     if let Some(positional_deletes) = delete_filter.get_delete_vector(&task) {
@@ -379,7 +373,7 @@ pub(super) async fn read_vortex_task(
         )?)
     });
 
-    if layout_splits && let Some(batch_size) = batch_size {
+    if let Some(batch_size) = batch_size {
         let record_batch_stream = record_batch_stream
             .map_ok(move |batch| {
                 let rows = batch.num_rows();
@@ -1678,7 +1672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_vortex_layout_splits_preserve_filtered_output_batches() {
+    async fn test_vortex_layout_batches_preserve_filtered_output_batches() {
         use crate::metadata_columns::{
             RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
             RESERVED_COL_NAME_POS, RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_FILE,
@@ -1721,115 +1715,104 @@ mod tests {
             RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
             RESERVED_FIELD_ID_FILE,
         ];
-        for layout_splits in [false, true] {
-            for (projection, minimum_id) in
-                [(projected.clone(), 1), (vec![], 1), (projected.clone(), 5)]
-            {
-                let task = FileScanTask::builder()
-                    .with_file_size_in_bytes(file.file_size_in_bytes())
-                    .with_start(0)
-                    .with_length(0)
-                    .with_data_file_path(path.clone())
-                    .with_data_file_format(DataFileFormat::Vortex)
-                    .with_schema(Arc::clone(&schema))
-                    .with_case_sensitive(true)
-                    .with_project_field_ids(projection.clone())
-                    .with_first_row_id(Some(100))
-                    .with_data_sequence_number(Some(7))
-                    .with_predicate(Some(
-                        Reference::new("id")
-                            .greater_than(Datum::long(minimum_id))
-                            .bind(Arc::clone(&schema), true)
-                            .unwrap(),
-                    ))
-                    .with_deletes(vec![delete_file_entry(
-                        &delete_path,
-                        DataContentType::PositionDeletes,
-                    )])
-                    .build()
-                    .unwrap();
-                let batches: Vec<RecordBatch> =
-                    ArrowReaderBuilder::new(io.clone(), Runtime::current())
-                        .with_batch_size(2)
-                        .with_vortex_layout_splits(layout_splits)
-                        .build()
-                        .read(Box::pin(futures::stream::iter([Ok(task)])))
-                        .unwrap()
-                        .stream()
-                        .try_collect()
-                        .await
-                        .unwrap();
-                if minimum_id == 5 {
-                    assert!(batches.is_empty());
-                    continue;
-                }
-                let sizes = batches
-                    .iter()
-                    .map(RecordBatch::num_rows)
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    sizes,
-                    if layout_splits {
-                        vec![2, 1]
-                    } else {
-                        vec![1, 1, 1]
-                    }
-                );
-                if projection.is_empty() {
-                    assert!(batches.iter().all(|batch| batch.num_columns() == 0));
-                    continue;
-                }
-                let actual =
-                    arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
-                let expected_names = [
-                    "label",
-                    RESERVED_COL_NAME_POS,
-                    RESERVED_COL_NAME_ROW_ID,
-                    RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
-                    RESERVED_COL_NAME_FILE,
-                ];
-                let fields = actual
-                    .schema()
-                    .fields()
-                    .iter()
-                    .zip(expected_names)
-                    .zip([
-                        DataType::Utf8,
-                        DataType::Int64,
-                        DataType::Int64,
-                        DataType::Int64,
-                        DataType::Utf8,
-                    ])
-                    .map(|((field, name), data_type)| {
-                        field
-                            .as_ref()
-                            .clone()
-                            .with_name(name)
-                            .with_data_type(data_type)
-                    })
-                    .collect::<Vec<_>>();
-                let schema = Arc::new(ArrowSchema::new(fields));
-                let actual = RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    actual
-                        .columns()
-                        .iter()
-                        .zip(schema.fields())
-                        .map(|(column, field)| arrow_cast::cast(column, field.data_type()))
-                        .collect::<Result<Vec<_>, _>>()
+        for (projection, minimum_id) in
+            [(projected.clone(), 1), (vec![], 1), (projected.clone(), 5)]
+        {
+            let task = FileScanTask::builder()
+                .with_file_size_in_bytes(file.file_size_in_bytes())
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(path.clone())
+                .with_data_file_format(DataFileFormat::Vortex)
+                .with_schema(Arc::clone(&schema))
+                .with_case_sensitive(true)
+                .with_project_field_ids(projection.clone())
+                .with_first_row_id(Some(100))
+                .with_data_sequence_number(Some(7))
+                .with_predicate(Some(
+                    Reference::new("id")
+                        .greater_than(Datum::long(minimum_id))
+                        .bind(Arc::clone(&schema), true)
                         .unwrap(),
-                )
+                ))
+                .with_deletes(vec![delete_file_entry(
+                    &delete_path,
+                    DataContentType::PositionDeletes,
+                )])
+                .build()
                 .unwrap();
-                let expected = RecordBatch::try_new(schema, vec![
-                    Arc::new(StringArray::from(vec![Some("b"), None, Some("e")])),
-                    Arc::new(Int64Array::from(vec![1, 2, 4])),
-                    Arc::new(Int64Array::from(vec![101, 102, 104])),
-                    Arc::new(Int64Array::from(vec![7, 7, 7])),
-                    Arc::new(StringArray::from(vec![path.as_str(); 3])),
-                ])
+            let batches: Vec<RecordBatch> = ArrowReaderBuilder::new(io.clone(), Runtime::current())
+                .with_batch_size(2)
+                .build()
+                .read(Box::pin(futures::stream::iter([Ok(task)])))
+                .unwrap()
+                .stream()
+                .try_collect()
+                .await
                 .unwrap();
-                assert_eq!(actual, expected);
+            if minimum_id == 5 {
+                assert!(batches.is_empty());
+                continue;
             }
+            let sizes = batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>();
+            assert_eq!(sizes, vec![2, 1]);
+            if projection.is_empty() {
+                assert!(batches.iter().all(|batch| batch.num_columns() == 0));
+                continue;
+            }
+            let actual =
+                arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+            let expected_names = [
+                "label",
+                RESERVED_COL_NAME_POS,
+                RESERVED_COL_NAME_ROW_ID,
+                RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+                RESERVED_COL_NAME_FILE,
+            ];
+            let fields = actual
+                .schema()
+                .fields()
+                .iter()
+                .zip(expected_names)
+                .zip([
+                    DataType::Utf8,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Utf8,
+                ])
+                .map(|((field, name), data_type)| {
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_name(name)
+                        .with_data_type(data_type)
+                })
+                .collect::<Vec<_>>();
+            let schema = Arc::new(ArrowSchema::new(fields));
+            let actual = RecordBatch::try_new(
+                Arc::clone(&schema),
+                actual
+                    .columns()
+                    .iter()
+                    .zip(schema.fields())
+                    .map(|(column, field)| arrow_cast::cast(column, field.data_type()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            )
+            .unwrap();
+            let expected = RecordBatch::try_new(schema, vec![
+                Arc::new(StringArray::from(vec![Some("b"), None, Some("e")])),
+                Arc::new(Int64Array::from(vec![1, 2, 4])),
+                Arc::new(Int64Array::from(vec![101, 102, 104])),
+                Arc::new(Int64Array::from(vec![7, 7, 7])),
+                Arc::new(StringArray::from(vec![path.as_str(); 3])),
+            ])
+            .unwrap();
+            assert_eq!(actual, expected);
         }
     }
 
