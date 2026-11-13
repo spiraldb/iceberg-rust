@@ -198,22 +198,42 @@ impl ArrowReader {
     ) -> Result<Vec<usize>> {
         let row_groups = parquet_metadata.row_groups();
         let mut selected = Vec::new();
-        let end = start + length;
-
-        // Row groups are stored sequentially after the 4-byte magic header.
-        let mut current_byte_offset = 4u64;
+        let end = start.checked_add(length).ok_or_else(|| {
+            Error::new(ErrorKind::DataInvalid, "File scan byte range overflows u64")
+        })?;
 
         for (idx, row_group) in row_groups.iter().enumerate() {
-            let row_group_size = row_group.compressed_size() as u64;
-            let row_group_midpoint = current_byte_offset + row_group_size / 2;
+            let mut row_group_start = u64::MAX;
+            let mut row_group_end = 0;
+            for column in row_group.columns() {
+                let column_start = column
+                    .dictionary_page_offset()
+                    .unwrap_or_else(|| column.data_page_offset());
+                let column_start = u64::try_from(column_start).map_err(|_| {
+                    Error::new(ErrorKind::DataInvalid, "Negative Parquet column offset")
+                })?;
+                let column_length = u64::try_from(column.compressed_size()).map_err(|_| {
+                    Error::new(ErrorKind::DataInvalid, "Negative Parquet column length")
+                })?;
+                let column_end = column_start.checked_add(column_length).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Parquet column byte range overflows u64",
+                    )
+                })?;
+                row_group_start = row_group_start.min(column_start);
+                row_group_end = row_group_end.max(column_end);
+            }
+            if row_group.columns().is_empty() {
+                continue;
+            }
+            let row_group_midpoint = row_group_start + (row_group_end - row_group_start) / 2;
 
             // Half-open ownership: a midpoint on a task boundary belongs to the upper task,
             // so exactly one task ever claims a given row group.
             if start <= row_group_midpoint && row_group_midpoint < end {
                 selected.push(idx);
             }
-
-            current_byte_offset += row_group_size;
         }
 
         Ok(selected)
@@ -509,7 +529,11 @@ mod tests {
         let file = File::create(&file_path).unwrap();
         let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
         writer.write(&batch1).expect("Writing batch 1");
+        writer.flush().unwrap();
+        writer.write_all(&[0; 64 * 1024]).unwrap();
         writer.write(&batch2).expect("Writing batch 2");
+        writer.flush().unwrap();
+        writer.write_all(&[0; 64 * 1024]).unwrap();
         writer.write(&batch3).expect("Writing batch 3");
         writer.close().unwrap();
 
@@ -526,10 +550,12 @@ mod tests {
         let row_group_1 = metadata.row_group(1);
         let row_group_2 = metadata.row_group(2);
 
-        let rg0_start = 4u64; // Parquet files start with 4-byte magic "PAR1"
-        let rg1_start = rg0_start + row_group_0.compressed_size() as u64;
-        let rg2_start = rg1_start + row_group_1.compressed_size() as u64;
+        let rg0_start = row_group_0.column(0).byte_range().0;
+        let rg1_start = row_group_1.column(0).byte_range().0;
+        let rg2_start = row_group_2.column(0).byte_range().0;
         let file_end = rg2_start + row_group_2.compressed_size() as u64;
+        assert!(row_group_0.column(0).dictionary_page_offset().is_some());
+        assert!(rg1_start > rg0_start + row_group_0.compressed_size() as u64);
 
         println!(
             "Row group 0: {} rows, starts at byte {}, {} bytes compressed",
