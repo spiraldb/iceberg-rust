@@ -17,9 +17,17 @@
 
 //! Parquet file data reader
 
+use std::sync::Arc;
+
+use arrow_schema::SchemaRef;
+use parquet::arrow::arrow_reader::RowFilter;
+use parquet::file::metadata::ParquetMetaData;
+
+use crate::Result;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
+use crate::scan::FileScanTask;
 use crate::util::available_parallelism;
 
 /// Default gap between byte ranges below which they are coalesced into a
@@ -33,6 +41,12 @@ const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 10;
 /// Default number of bytes to prefetch when parsing Parquet footer metadata.
 /// Matches DataFusion's default `ParquetOptions::metadata_size_hint`.
 const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
+
+type RowFilterFactory = Arc<
+    dyn Fn(&FileScanTask, &SchemaRef, &Arc<ParquetMetaData>) -> Result<Option<RowFilter>>
+        + Send
+        + Sync,
+>;
 
 mod file_reader;
 mod options;
@@ -61,6 +75,7 @@ pub struct ArrowReaderBuilder {
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
+    row_filter_factory: Option<RowFilterFactory>,
 }
 
 impl ArrowReaderBuilder {
@@ -77,6 +92,7 @@ impl ArrowReaderBuilder {
             bloom_filter_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
+            row_filter_factory: None,
         }
     }
 
@@ -90,6 +106,20 @@ impl ArrowReaderBuilder {
     /// to something other than the default
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Adds per-file Parquet row filters before the scan and delete predicates.
+    ///
+    /// The factory receives the full physical schema with resolved field IDs and
+    /// must return a fresh filter for each file. Returning `None` leaves that file
+    /// unfiltered by the factory. Filters must preserve rows needed by the caller.
+    pub fn with_row_filter_factory<F>(mut self, factory: F) -> Self
+    where F: Fn(&FileScanTask, &SchemaRef, &Arc<ParquetMetaData>) -> Result<Option<RowFilter>>
+            + Send
+            + Sync
+            + 'static {
+        self.row_filter_factory = Some(Arc::new(factory));
         self
     }
 
@@ -161,6 +191,7 @@ impl ArrowReaderBuilder {
             row_selection_enabled: self.row_selection_enabled,
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
+            row_filter_factory: self.row_filter_factory,
         }
     }
 }
@@ -179,4 +210,5 @@ pub struct ArrowReader {
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    row_filter_factory: Option<RowFilterFactory>,
 }
